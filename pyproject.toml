@@ -26,6 +26,10 @@ dependencies = [
 [project.optional-dependencies]
 cpu = ["torch==2.11.0+cpu"]
 gpu-cu126 = ["torch==2.11.0+cu126"]
+dev = ["pytest==8.4.2"]
 
 [tool.setuptools.packages.find]
 include = ["lazy_whisper_api*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
