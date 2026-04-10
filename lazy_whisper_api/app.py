@@ -6,13 +6,15 @@ import atexit
 from typing import Any
 
 import torch
-from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, UploadFile, WebSocket
 
 from .auth import build_api_key_dependency
 from .config import configure_logging, load_settings
 from .errors import http_exception_handler
 from .model_manager import ModelManager
+from .realtime import RealtimeTranscriptionServer
 from .responses import build_transcription_response
+from .streaming import create_transcription_stream_response
 from .transcription import TranscriptionRequest, transcribe_upload
 
 
@@ -24,7 +26,7 @@ def create_app() -> FastAPI:
     model_manager = ModelManager(settings)
     atexit.register(model_manager.unload_all)
 
-    app = FastAPI(title="Local Whisper API", version="2.1.0")
+    app = FastAPI(title="Local Whisper API", version="2.2.0")
     app.add_exception_handler(HTTPException, http_exception_handler)
     app.state.settings = settings
     app.state.model_manager = model_manager
@@ -59,6 +61,7 @@ def create_app() -> FastAPI:
         language: str | None,
         prompt: str | None,
         response_format: str,
+        stream: bool,
         temperature: float,
         timestamp_granularities: list[str] | None,
     ):
@@ -72,6 +75,20 @@ def create_app() -> FastAPI:
             temperature=temperature,
             timestamp_granularities=timestamp_granularities,
         )
+        if stream:
+            if task != "transcribe":
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "message": "Streaming is only supported for /v1/audio/transcriptions.",
+                        "type": "invalid_request_error",
+                    },
+                )
+            return await create_transcription_stream_response(
+                settings=settings,
+                model_manager=model_manager,
+                payload=payload,
+            )
         result = await transcribe_upload(
             settings=settings,
             model_manager=model_manager,
@@ -86,6 +103,7 @@ def create_app() -> FastAPI:
         language: str | None = Form(default=None),
         prompt: str | None = Form(default=None),
         response_format: str = Form(default="json"),
+        stream: bool = Form(default=False),
         temperature: float = Form(default=0.0),
         timestamp_granularities: list[str] | None = Form(
             default=None,
@@ -99,6 +117,7 @@ def create_app() -> FastAPI:
             language=language,
             prompt=prompt,
             response_format=response_format,
+            stream=stream,
             temperature=temperature,
             timestamp_granularities=timestamp_granularities,
         )
@@ -109,6 +128,7 @@ def create_app() -> FastAPI:
         model: str = Form(...),
         prompt: str | None = Form(default=None),
         response_format: str = Form(default="json"),
+        stream: bool = Form(default=False),
         temperature: float = Form(default=0.0),
         timestamp_granularities: list[str] | None = Form(
             default=None,
@@ -122,9 +142,18 @@ def create_app() -> FastAPI:
             language=None,
             prompt=prompt,
             response_format=response_format,
+            stream=stream,
             temperature=temperature,
             timestamp_granularities=timestamp_granularities,
         )
+
+    @app.websocket("/v1/realtime")
+    async def realtime_transcription(websocket: WebSocket) -> None:
+        server = RealtimeTranscriptionServer(
+            settings=settings,
+            model_manager=model_manager,
+        )
+        await server.run(websocket)
 
     app.include_router(v1_router)
     return app

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tempfile
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,8 @@ from .model_manager import ModelManager
 
 SUPPORTED_RESPONSE_FORMATS = {"json", "text", "srt", "verbose_json", "vtt"}
 SUPPORTED_TIMESTAMP_GRANULARITIES = {"segment", "word"}
+PCM16_SAMPLE_WIDTH_BYTES = 2
+PCM16_CHANNELS = 1
 
 
 @dataclass(frozen=True)
@@ -77,6 +80,11 @@ def segments_to_text(segments: list[Any]) -> str:
     return "".join(segment.text for segment in segments).strip()
 
 
+def normalize_timestamp_granularities(values: list[str] | None) -> set[str]:
+    """Return a normalized timestamp granularity set."""
+    return set(values or [])
+
+
 async def write_upload_to_tempfile(
     *,
     upload: UploadFile,
@@ -116,6 +124,79 @@ def transcribe_sync(
     return list(segments_iter), info
 
 
+def iter_transcribe_sync(
+    *,
+    model: Any,
+    audio_path: Path,
+    language: str | None,
+    task: str,
+    prompt: str | None,
+    temperature: float,
+    word_timestamps: bool,
+    vad_filter: bool,
+) -> tuple[Any, Any]:
+    """Start a Faster Whisper transcription and return its segment iterator."""
+    return model.transcribe(
+        str(audio_path),
+        language=language or None,
+        task=task,
+        initial_prompt=prompt or None,
+        temperature=temperature,
+        word_timestamps=word_timestamps,
+        vad_filter=vad_filter,
+    )
+
+
+def write_pcm16_wav(
+    *,
+    pcm_bytes: bytes,
+    sample_rate_hz: int,
+    destination: Path,
+) -> None:
+    """Wrap raw PCM16 mono bytes in a WAV container for Faster Whisper."""
+    with wave.open(str(destination), "wb") as handle:
+        handle.setnchannels(PCM16_CHANNELS)
+        handle.setsampwidth(PCM16_SAMPLE_WIDTH_BYTES)
+        handle.setframerate(sample_rate_hz)
+        handle.writeframes(pcm_bytes)
+
+
+def transcribe_pcm16_sync(
+    *,
+    model: Any,
+    pcm_bytes: bytes,
+    sample_rate_hz: int,
+    language: str | None,
+    task: str,
+    prompt: str | None,
+    temperature: float,
+    word_timestamps: bool,
+    vad_filter: bool,
+) -> tuple[list[Any], Any]:
+    """Transcribe raw PCM16 mono audio by wrapping it in a temporary WAV file."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+        tmp_path = Path(tmp.name)
+
+    try:
+        write_pcm16_wav(
+            pcm_bytes=pcm_bytes,
+            sample_rate_hz=sample_rate_hz,
+            destination=tmp_path,
+        )
+        return transcribe_sync(
+            model=model,
+            audio_path=tmp_path,
+            language=language,
+            task=task,
+            prompt=prompt,
+            temperature=temperature,
+            word_timestamps=word_timestamps,
+            vad_filter=vad_filter,
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 async def transcribe_upload(
     *,
     settings: Settings,
@@ -136,7 +217,7 @@ async def transcribe_upload(
             chunk_size=settings.upload_chunk_size,
         )
 
-        granularity_set = set(payload.timestamp_granularities or [])
+        granularity_set = normalize_timestamp_granularities(payload.timestamp_granularities)
         with model_manager.lease(canonical_model) as lease:
             if lease.model is None:
                 raise RuntimeError(f"Model '{canonical_model}' is not loaded.")

@@ -11,12 +11,11 @@ It is designed for a home lab or workstation where the API should stay up, but m
 
 ## Features
 
-- OpenAI-style endpoints:
-- `POST /v1/audio/transcriptions`
-- `POST /v1/audio/translations`
-- `GET /v1/models`
+- OpenAI-style endpoints: `POST /v1/audio/transcriptions`, `POST /v1/audio/translations`, `WS /v1/realtime`, `GET /v1/models`
 - API key authentication on `/v1/*`
 - API key authentication on `/healthz`
+- `stream=true` support on completed-audio transcriptions via SSE
+- Realtime transcription-only sessions over WebSocket
 - Lazy model loading and timed unloading
 - Per-model device selection
 - Hard limits for loaded models per device family and active transcriptions per model
@@ -48,6 +47,8 @@ Current default behavior:
 - [lazy_whisper_api/config.py](/home/wandeber/codex-playground/lazy_whisper_api/config.py): `.env` parsing and validation
 - [lazy_whisper_api/model_manager.py](/home/wandeber/codex-playground/lazy_whisper_api/model_manager.py): lazy model loading and unload timers
 - [lazy_whisper_api/transcription.py](/home/wandeber/codex-playground/lazy_whisper_api/transcription.py): request validation and Faster Whisper calls
+- [lazy_whisper_api/streaming.py](/home/wandeber/codex-playground/lazy_whisper_api/streaming.py): SSE orchestration for `stream=true`
+- [lazy_whisper_api/realtime.py](/home/wandeber/codex-playground/lazy_whisper_api/realtime.py): realtime WebSocket sessions, PCM buffering, VAD, and event emission
 - [lazy_whisper_api/responses.py](/home/wandeber/codex-playground/lazy_whisper_api/responses.py): JSON/text/subtitle response builders
 - [whisper-api.sh](/home/wandeber/codex-playground/whisper-api.sh): manual launcher
 - [whisper-service.sh](/home/wandeber/codex-playground/whisper-service.sh): persistent service controller
@@ -131,6 +132,161 @@ with open("audio.mp3", "rb") as audio_file:
 print(transcript.text)
 ```
 
+## Streaming Completed Audio
+
+For completed files, keep using `POST /v1/audio/transcriptions` and add `stream=true`.
+
+```bash
+curl --no-buffer -X POST http://127.0.0.1:43556/v1/audio/transcriptions \
+  -H "Authorization: Bearer your-api-key" \
+  -F file=@audio.mp3 \
+  -F model=whisper-1 \
+  -F stream=true \
+  -F 'timestamp_granularities[]=segment'
+```
+
+The response is `text/event-stream` and emits:
+
+- `transcript.text.delta`
+- `transcript.text.done`
+- `error`
+
+Current behavior:
+
+- HTTP streaming is only supported on `/v1/audio/transcriptions`
+- `POST /v1/audio/translations` with `stream=true` returns `400`
+- `delta` events are segment-level, not token-level
+- if `timestamp_granularities[]=segment` is requested, each `delta` includes segment timestamps
+
+## Realtime Transcription
+
+For audio that is still being recorded, use `WS /v1/realtime`.
+This implementation is transcription-only and follows an OpenAI-like event model.
+
+Current supported input contract:
+
+- WebSocket path: `ws://127.0.0.1:43556/v1/realtime`
+- auth for backend clients: `Authorization: Bearer ...`
+- auth for browser clients: `?api_key=...`
+- audio format: raw `audio/pcm`
+- sample rate: `24000`
+- mono PCM16 in base64 chunks
+
+Supported client events:
+
+- `session.update`
+- `input_audio_buffer.append`
+- `input_audio_buffer.commit`
+- `input_audio_buffer.clear`
+
+Supported server events:
+
+- `session.created`
+- `session.updated`
+- `input_audio_buffer.committed`
+- `conversation.item.input_audio_transcription.delta`
+- `conversation.item.input_audio_transcription.completed`
+- `error`
+
+Python example with manual commit:
+
+```python
+import asyncio
+import base64
+import json
+import websockets
+
+API_KEY = "your-api-key"
+PCM_CHUNK = b"...raw pcm16 mono 24k bytes..."
+
+async def main():
+    uri = "ws://127.0.0.1:43556/v1/realtime"
+    async with websockets.connect(
+        uri,
+        additional_headers={"Authorization": f"Bearer {API_KEY}"},
+    ) as ws:
+        print(json.loads(await ws.recv()))
+
+        await ws.send(json.dumps({
+            "type": "session.update",
+            "session": {
+                "type": "transcription",
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcm", "rate": 24000},
+                        "transcription": {"model": "whisper-1", "language": "es"},
+                        "turn_detection": None,
+                    }
+                }
+            },
+        }))
+        print(json.loads(await ws.recv()))
+
+        await ws.send(json.dumps({
+            "type": "input_audio_buffer.append",
+            "audio": base64.b64encode(PCM_CHUNK).decode("ascii"),
+        }))
+        await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+
+        while True:
+            event = json.loads(await ws.recv())
+            print(event)
+            if event["type"] == "conversation.item.input_audio_transcription.completed":
+                break
+
+asyncio.run(main())
+```
+
+Browser example with `server_vad`:
+
+```js
+const ws = new WebSocket(
+  "ws://127.0.0.1:43556/v1/realtime?api_key=your-api-key"
+);
+
+ws.addEventListener("open", () => {
+  ws.send(JSON.stringify({
+    type: "session.update",
+    session: {
+      type: "transcription",
+      audio: {
+        input: {
+          format: { type: "audio/pcm", rate: 24000 },
+          transcription: { model: "whisper-1", language: "en" },
+          turn_detection: {
+            type: "server_vad",
+            threshold: 0.5,
+            prefix_padding_ms: 300,
+            silence_duration_ms: 500,
+          },
+        },
+      },
+    },
+  }));
+});
+
+function sendPcmChunk(uint8Array) {
+  let binary = "";
+  for (const byte of uint8Array) binary += String.fromCharCode(byte);
+  ws.send(JSON.stringify({
+    type: "input_audio_buffer.append",
+    audio: btoa(binary),
+  }));
+}
+
+ws.addEventListener("message", (event) => {
+  console.log(JSON.parse(event.data));
+});
+```
+
+Notes:
+
+- this is WebSocket only in v1, not WebRTC
+- realtime is transcription-only, not bot chat
+- idle sockets do not reserve model capacity
+- a turn acquires model capacity only when audio actually starts being transcribed
+- after commit you may still receive one last `delta` before `completed`
+
 ## Configuration
 
 All runtime configuration lives in `.env`.
@@ -168,6 +324,8 @@ Concurrency behavior:
 - if a model already has 2 active transcriptions, the API returns `429`
 - if a new model would exceed CPU/GPU loaded-model capacity and there is no idle model to evict, the API returns `503`
 - if there are idle loaded models on the same device family, the oldest one is unloaded to make room
+- the same limits apply to classic HTTP requests, SSE streaming requests, and realtime turns
+- on realtime sockets, saturation is reported as an `error` event while the socket stays open
 
 For a deeper walkthrough of how config, auth, model loading, and response rendering fit together, see [docs/architecture.md](/home/wandeber/codex-playground/docs/architecture.md).
 
