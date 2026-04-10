@@ -59,8 +59,15 @@ Current default behavior:
 
 ## Benchmark Notes
 
-There is a small benchmark snapshot for the classic non-streaming endpoint in [docs/benchmarks.md](/home/wandeber/codex-playground/docs/benchmarks.md).
-Those numbers are machine-specific and should be read as relative guidance, not as universal guarantees.
+There is a small benchmark snapshot in `docs/benchmarks.md`.
+It currently covers:
+
+- model comparison on the classic non-streaming transcription endpoint
+- endpoint-style comparison for the same `turbo` model across classic JSON,
+  classic SSE, and stable realtime manual-commit flows
+
+Those numbers are machine-specific and should be read as relative guidance, not
+as universal guarantees.
 
 ## Quick Start
 
