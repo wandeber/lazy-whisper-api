@@ -5,20 +5,21 @@ OpenAI-compatible local transcription API built on top of `faster-whisper`.
 It is designed for a home lab or workstation where the API should stay up, but models should wake up only on demand:
 
 - `turbo` loads on demand on GPU and unloads after an idle timeout
-- `large-v3` loads on demand on CPU and unloads immediately after each request
+- `large-v3` loads on demand on CPU and unloads after a configurable idle timeout
 - `distil-multi4` loads on demand on GPU and unloads after an idle timeout
 - the API itself can be managed as a persistent `systemd --user` service
 
 ## Features
 
 - OpenAI-style endpoints:
-  - `POST /v1/audio/transcriptions`
-  - `POST /v1/audio/translations`
-  - `GET /v1/models`
+- `POST /v1/audio/transcriptions`
+- `POST /v1/audio/translations`
+- `GET /v1/models`
 - API key authentication on `/v1/*`
+- API key authentication on `/healthz`
 - Lazy model loading and timed unloading
 - Per-model device selection
-- Public-health endpoint at `/healthz`
+- Hard limits for loaded models per device family and active transcriptions per model
 - Local `systemd --user` start/stop/status/logs workflow
 
 ## Models
@@ -34,16 +35,25 @@ Current aliases:
 Current default behavior:
 
 - `turbo`: GPU, unload after 90 minutes idle
-- `large-v3`: CPU, unload immediately after request
+- `large-v3`: CPU, unload after 10 minutes idle
 - `distil-multi4`: GPU, unload after 90 minutes idle
+- only 1 CPU model can stay loaded at once
+- only 2 GPU models can stay loaded at once
+- each model accepts up to 2 active transcriptions in parallel
 
 ## Repo Layout
 
-- [whisper_api.py](/home/wandeber/codex-playground/whisper_api.py): FastAPI application
+- [whisper_api.py](/home/wandeber/codex-playground/whisper_api.py): compatibility entrypoint used by `uvicorn`
+- [lazy_whisper_api/app.py](/home/wandeber/codex-playground/lazy_whisper_api/app.py): route wiring and app creation
+- [lazy_whisper_api/config.py](/home/wandeber/codex-playground/lazy_whisper_api/config.py): `.env` parsing and validation
+- [lazy_whisper_api/model_manager.py](/home/wandeber/codex-playground/lazy_whisper_api/model_manager.py): lazy model loading and unload timers
+- [lazy_whisper_api/transcription.py](/home/wandeber/codex-playground/lazy_whisper_api/transcription.py): request validation and Faster Whisper calls
+- [lazy_whisper_api/responses.py](/home/wandeber/codex-playground/lazy_whisper_api/responses.py): JSON/text/subtitle response builders
 - [whisper-api.sh](/home/wandeber/codex-playground/whisper-api.sh): manual launcher
 - [whisper-service.sh](/home/wandeber/codex-playground/whisper-service.sh): persistent service controller
 - [.env.example](/home/wandeber/codex-playground/.env.example): safe example config
 - [whisper-large.sh](/home/wandeber/codex-playground/whisper-large.sh): direct CLI launcher for `large-v3`
+- [docs/architecture.md](/home/wandeber/codex-playground/docs/architecture.md): architecture and runtime flow notes
 
 ## Quick Start
 
@@ -88,7 +98,8 @@ WHISPER_API_KEY=change-me
 5. Check health:
 
 ```bash
-curl http://127.0.0.1:43556/healthz
+curl http://127.0.0.1:43556/healthz \
+  -H "Authorization: Bearer your-api-key"
 ```
 
 ## Example Request
@@ -136,6 +147,10 @@ Important variables:
 - `WHISPER_MODEL_COMPUTE_TYPE_MAP`
 - `WHISPER_MODEL_IDLE_SECONDS_MAP`
 - `WHISPER_MODEL_VAD_MAP`
+- `WHISPER_MAX_LOADED_MODELS_CPU`
+- `WHISPER_MAX_LOADED_MODELS_GPU`
+- `WHISPER_MAX_CONCURRENT_REQUESTS_PER_MODEL`
+- `WHISPER_UPLOAD_CHUNK_SIZE`
 - `WHISPER_CPU_THREADS`
 - `WHISPER_LOG_LEVEL`
 
@@ -144,6 +159,17 @@ After editing `.env`, apply changes with:
 ```bash
 ./whisper-service.sh restart
 ```
+
+`WHISPER_MODEL_IDLE_SECONDS_MAP` is the knob that controls how long each model stays loaded after the last request. Current default values are `turbo=5400,large-v3=600,distil-multi4=5400`.
+GPU and CPU defaults both use `int8` here, because on this GTX 1070 + current CTranslate2 backend that is explicit and actually supported, unlike `float16` or `int8_float16`.
+
+Concurrency behavior:
+
+- if a model already has 2 active transcriptions, the API returns `429`
+- if a new model would exceed CPU/GPU loaded-model capacity and there is no idle model to evict, the API returns `503`
+- if there are idle loaded models on the same device family, the oldest one is unloaded to make room
+
+For a deeper walkthrough of how config, auth, model loading, and response rendering fit together, see [docs/architecture.md](/home/wandeber/codex-playground/docs/architecture.md).
 
 ## Dependency Setup
 
@@ -204,6 +230,8 @@ To build it locally:
   --copy_files tokenizer.json preprocessor_config.json tokenizer_config.json generation_config.json vocab.json merges.txt added_tokens.json special_tokens_map.json \
   --quantization float16
 ```
+
+This repo intentionally keeps `distil-multi4` as the only distil model because it is the multilingual one already aligned with the API's use case.
 
 ## What Is Ignored
 

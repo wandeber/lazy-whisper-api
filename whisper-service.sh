@@ -93,9 +93,14 @@ wait_until_ready() {
   load_env_file
   local health_url="http://${STATUS_HOST}:${STATUS_PORT}/healthz"
   local attempt
+  local -a curl_args=(-fsS)
+
+  if [[ -n "${WHISPER_API_KEY:-}" ]]; then
+    curl_args+=(-H "Authorization: Bearer ${WHISPER_API_KEY}")
+  fi
 
   for attempt in $(seq 1 60); do
-    if curl -fsS "$health_url" >/dev/null 2>&1; then
+    if curl "${curl_args[@]}" "$health_url" >/dev/null 2>&1; then
       echo "API lista en $health_url"
       return 0
     fi
