@@ -47,25 +47,45 @@ Current default behavior:
 
 ## Quick Start
 
-1. Create your local config:
+1. Install dependencies.
+
+For the base Python dependencies:
+
+```bash
+make install
+```
+
+For a machine like this one with NVIDIA GPU support:
+
+```bash
+make install-gpu
+```
+
+For CPU-only:
+
+```bash
+make install-cpu
+```
+
+2. Create your local config:
 
 ```bash
 cp .env.example .env
 ```
 
-2. Edit `.env` and set at least:
+3. Edit `.env` and set at least:
 
 ```bash
 WHISPER_API_KEY=change-me
 ```
 
-3. Start the API:
+4. Start the API:
 
 ```bash
 ./whisper-service.sh start
 ```
 
-4. Check health:
+5. Check health:
 
 ```bash
 curl http://127.0.0.1:43556/healthz
@@ -125,6 +145,28 @@ After editing `.env`, apply changes with:
 ./whisper-service.sh restart
 ```
 
+## Dependency Setup
+
+This repo now includes a central Python project manifest:
+
+- [pyproject.toml](/home/wandeber/codex-playground/pyproject.toml)
+- [Makefile](/home/wandeber/codex-playground/Makefile)
+- [requirements-common.txt](/home/wandeber/codex-playground/requirements-common.txt)
+- [requirements-gpu-cu126.txt](/home/wandeber/codex-playground/requirements-gpu-cu126.txt)
+- [requirements-cpu.txt](/home/wandeber/codex-playground/requirements-cpu.txt)
+
+Closest equivalent to `package.json` here is `pyproject.toml`.
+
+Practical commands:
+
+```bash
+make install
+make install-gpu
+make install-cpu
+```
+
+The `requirements-*.txt` files are still kept as simple export-friendly manifests, but the main source of truth for the repo is now [pyproject.toml](/home/wandeber/codex-playground/pyproject.toml).
+
 ## Service Control
 
 ```bash
@@ -172,6 +214,9 @@ The repository ignores:
 - local caches
 - local converted models
 - Python cache files
+
+The committed [bin/ffmpeg](/home/wandeber/codex-playground/bin/ffmpeg) file is only a small wrapper script.
+The real downloaded ffmpeg binary lives inside the virtual environment and is not committed.
 
 That keeps secrets, large binaries, and machine-specific data out of git.
 

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Wrapper script committed to the repo.
+# The actual ffmpeg binary is provided by imageio-ffmpeg inside the venv.
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_PYTHON="$SCRIPT_DIR/../.venv/bin/python"
 
