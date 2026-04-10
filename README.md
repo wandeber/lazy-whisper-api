@@ -55,6 +55,12 @@ Current default behavior:
 - [.env.example](/home/wandeber/codex-playground/.env.example): safe example config
 - [whisper-large.sh](/home/wandeber/codex-playground/whisper-large.sh): direct CLI launcher for `large-v3`
 - [docs/architecture.md](/home/wandeber/codex-playground/docs/architecture.md): architecture and runtime flow notes
+- [docs/benchmarks.md](/home/wandeber/codex-playground/docs/benchmarks.md): machine-specific benchmark notes for the classic endpoint
+
+## Benchmark Notes
+
+There is a small benchmark snapshot for the classic non-streaming endpoint in [docs/benchmarks.md](/home/wandeber/codex-playground/docs/benchmarks.md).
+Those numbers are machine-specific and should be read as relative guidance, not as universal guarantees.
 
 ## Quick Start
 
