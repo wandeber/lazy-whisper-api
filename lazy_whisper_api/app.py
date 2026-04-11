@@ -1,4 +1,4 @@
-"""FastAPI application assembly for the lazy Whisper API."""
+"""FastAPI application assembly for the lazy multi-backend ASR API."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ def create_app() -> FastAPI:
     model_manager = ModelManager(settings)
     atexit.register(model_manager.unload_all)
 
-    app = FastAPI(title="Local Whisper API", version="2.2.0")
+    app = FastAPI(title="Local ASR API", version="3.0.0")
     app.add_exception_handler(HTTPException, http_exception_handler)
     app.state.settings = settings
     app.state.model_manager = model_manager
@@ -45,12 +45,22 @@ def create_app() -> FastAPI:
 
     @v1_router.get("/models")
     def list_models() -> dict[str, Any]:
+        data = []
+        for model_id in settings.supported_model_ids:
+            canonical = settings.model_alias_map.get(model_id, model_id)
+            spec = settings.model_settings[canonical]
+            data.append(
+                {
+                    "id": model_id,
+                    "object": "model",
+                    "owned_by": "local-asr",
+                    "family": spec.family,
+                    "backend": spec.backend,
+                }
+            )
         return {
             "object": "list",
-            "data": [
-                {"id": model_id, "object": "model", "owned_by": "local-whisper"}
-                for model_id in settings.supported_model_ids
-            ],
+            "data": data,
         }
 
     async def handle_audio_request(

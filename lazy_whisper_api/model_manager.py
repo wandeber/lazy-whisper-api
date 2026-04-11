@@ -1,8 +1,7 @@
-"""Lazy loading and lifecycle management for Faster Whisper models."""
+"""Lazy loading and lifecycle management for multi-backend ASR models."""
 
 from __future__ import annotations
 
-import gc
 import logging
 import threading
 import time
@@ -12,8 +11,8 @@ from typing import Any
 
 import torch
 from fastapi import HTTPException
-from faster_whisper import WhisperModel
 
+from .backends import RuntimeHandle, build_runtime
 from .config import ModelSettings, Settings
 from .errors import api_error
 
@@ -26,7 +25,7 @@ class LoadedModel:
     """Runtime state for a model currently loaded in memory."""
 
     spec: ModelSettings
-    model: WhisperModel | None
+    runtime: RuntimeHandle | None
     actual_device: str
     actual_compute_type: str
     loaded_at: float
@@ -47,17 +46,19 @@ class ModelManager:
     def _device_family(self, device: str) -> str:
         return "cuda" if device.startswith("cuda") else "cpu"
 
-    def _device_limit(self, device_family: str) -> int:
-        if device_family == "cuda":
-            return self.settings.max_loaded_models_gpu
-        return self.settings.max_loaded_models_cpu
-
     def _loaded_for_family_locked(self, device_family: str) -> list[LoadedModel]:
         return [
             entry
             for entry in self._loaded.values()
             if self._device_family(entry.actual_device) == device_family
         ]
+
+    def _gpu_reserved_mb_locked(self) -> int:
+        return sum(
+            entry.spec.gpu_memory_reservation_mb
+            for entry in self._loaded.values()
+            if self._device_family(entry.actual_device) == "cuda"
+        )
 
     def _evict_oldest_idle_model_locked(
         self,
@@ -82,20 +83,35 @@ class ModelManager:
 
     def _ensure_capacity_for_new_model_locked(self, spec: ModelSettings, device: str) -> None:
         device_family = self._device_family(device)
-        limit = self._device_limit(device_family)
-        loaded_entries = self._loaded_for_family_locked(device_family)
+        if device_family == "cuda":
+            while (
+                self._gpu_reserved_mb_locked() + spec.gpu_memory_reservation_mb
+                > self.settings.gpu_memory_budget_mb
+            ):
+                if not self._evict_oldest_idle_model_locked(device_family="cuda"):
+                    raise api_error(
+                        503,
+                        (
+                            f"No GPU capacity available to load model '{spec.name}'. "
+                            f"Reservation requested: {spec.gpu_memory_reservation_mb} MiB; "
+                            f"budget: {self.settings.gpu_memory_budget_mb} MiB."
+                        ),
+                        error_type="server_busy",
+                    )
+            return
 
-        while len(loaded_entries) >= limit:
-            if not self._evict_oldest_idle_model_locked(device_family=device_family):
+        loaded_cpu_models = self._loaded_for_family_locked("cpu")
+        while len(loaded_cpu_models) >= self.settings.max_loaded_models_cpu:
+            if not self._evict_oldest_idle_model_locked(device_family="cpu"):
                 raise api_error(
                     503,
                     (
-                        f"No {device_family.upper()} capacity available to load model '{spec.name}'. "
-                        f"Limit: {limit} loaded model(s) on {device_family.upper()}."
+                        f"No CPU capacity available to load model '{spec.name}'. "
+                        f"Limit: {self.settings.max_loaded_models_cpu} loaded model(s) on CPU."
                     ),
                     error_type="server_busy",
                 )
-            loaded_entries = self._loaded_for_family_locked(device_family)
+            loaded_cpu_models = self._loaded_for_family_locked("cpu")
 
     def _cancel_timer_locked(self, entry: LoadedModel) -> None:
         if entry.timer is not None:
@@ -110,14 +126,11 @@ class ModelManager:
 
         self._cancel_timer_locked(entry)
         del self._loaded[model_name]
-        model = entry.model
-        entry.model = None
-        device = entry.actual_device
-        del model
-        gc.collect()
-        if device.startswith("cuda") and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        LOGGER.info("Unloaded model '%s' from %s", model_name, device)
+        runtime = entry.runtime
+        entry.runtime = None
+        if runtime is not None:
+            runtime.close()
+        LOGGER.info("Unloaded model '%s' from %s", model_name, entry.actual_device)
         return True
 
     def unload(self, model_name: str) -> bool:
@@ -146,6 +159,8 @@ class ModelManager:
         if spec.preferred_device.startswith("cuda") and not torch.cuda.is_available():
             LOGGER.warning("CUDA is not available for %s; using CPU instead", spec.name)
             return "cpu"
+        if spec.preferred_device.startswith("cuda"):
+            return "cuda"
         return spec.preferred_device
 
     def _build_loaded_model(
@@ -156,18 +171,11 @@ class ModelManager:
     ) -> LoadedModel:
         with self._lock:
             self._ensure_capacity_for_new_model_locked(spec, device)
-        model = WhisperModel(
-            spec.source,
-            device=device,
-            compute_type=spec.compute_type,
-            download_root=self.settings.download_root,
-            cpu_threads=self.settings.cpu_threads,
-            use_auth_token=self.settings.hf_token,
-        )
+        runtime = build_runtime(spec=spec, settings=self.settings, device=device)
         now = time.time()
         return LoadedModel(
             spec=spec,
-            model=model,
+            runtime=runtime,
             actual_device=device,
             actual_compute_type=spec.compute_type,
             loaded_at=now,
@@ -182,8 +190,10 @@ class ModelManager:
         for device in candidate_devices:
             try:
                 LOGGER.info(
-                    "Loading model '%s' from '%s' on %s with compute_type=%s",
+                    "Loading model '%s' family=%s backend=%s source='%s' on %s dtype=%s",
                     spec.name,
+                    spec.family,
+                    spec.backend,
                     spec.source,
                     device,
                     spec.compute_type,
@@ -234,12 +244,12 @@ class ModelManager:
         with self._lock:
             entry = self._loaded.get(model_name)
             if entry is not None:
-                if entry.use_count >= self.settings.max_concurrent_requests_per_model:
+                if entry.use_count >= spec.max_concurrent_requests:
                     raise api_error(
                         429,
                         (
                             f"Model '{model_name}' is already handling "
-                            f"{self.settings.max_concurrent_requests_per_model} transcription(s)."
+                            f"{spec.max_concurrent_requests} transcription(s)."
                         ),
                         error_type="rate_limit_error",
                     )
@@ -271,13 +281,17 @@ class ModelManager:
                 loaded.append(
                     {
                         "id": model_name,
+                        "family": entry.spec.family,
+                        "backend": entry.spec.backend,
                         "device": entry.actual_device,
                         "device_family": self._device_family(entry.actual_device),
                         "compute_type": entry.actual_compute_type,
+                        "gpu_memory_reservation_mb": entry.spec.gpu_memory_reservation_mb,
                         "busy": entry.use_count > 0,
                         "active_requests": entry.use_count,
-                        "max_concurrent_requests": self.settings.max_concurrent_requests_per_model,
+                        "max_concurrent_requests": entry.spec.max_concurrent_requests,
                         "idle_seconds": entry.spec.idle_seconds,
+                        "worker_pid": None if entry.runtime is None else entry.runtime.worker_pid,
                         "seconds_until_unload": (
                             None
                             if entry.use_count > 0 or entry.unload_at is None

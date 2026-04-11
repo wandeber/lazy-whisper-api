@@ -16,7 +16,7 @@ from starlette.concurrency import run_in_threadpool
 from .auth import require_api_key_value
 from .config import Settings
 from .model_manager import LoadedModel, ModelManager
-from .transcription import transcribe_pcm16_sync
+from .transcription import ensure_timestamp_segments_for_pcm, transcribe_pcm16_sync
 
 
 PCM_SAMPLE_RATE_HZ = 24_000
@@ -64,7 +64,6 @@ class RealtimeTurn:
     model_name: str
     language: str | None
     prompt: str | None
-    vad_filter: bool
     turn_detection: ServerVADConfig | None
     pcm_buffer: bytearray = field(default_factory=bytearray)
     frame_remainder: bytearray = field(default_factory=bytearray)
@@ -348,6 +347,10 @@ class RealtimeTranscriptionServer:
                     raise ValueError(
                         f"Unsupported model '{transcription['model']}'."
                     ) from exc
+                if not self.settings.model_settings[updated.model].supports("realtime"):
+                    raise ValueError(
+                        f"Model '{transcription['model']}' does not support realtime transcription."
+                    )
             if "language" in transcription:
                 updated.language = (
                     None if transcription["language"] in {None, ""} else str(transcription["language"])
@@ -410,7 +413,6 @@ class RealtimeTranscriptionServer:
             model_name=self.session.model,
             language=self.session.language,
             prompt=self.session.prompt,
-            vad_filter=self.settings.model_settings[self.session.model].vad_filter,
             turn_detection=(
                 None
                 if self.session.turn_detection is None
@@ -698,13 +700,13 @@ class RealtimeTranscriptionServer:
 
     async def transcribe_and_emit(self, turn: RealtimeTurn, *, final: bool) -> None:
         """Run one partial or final transcription pass for a turn."""
-        if turn.lease_entry is None or turn.lease_entry.model is None:
+        if turn.lease_entry is None or turn.lease_entry.runtime is None:
             raise RuntimeError(f"Turn '{turn.item_id}' has no active model lease.")
 
         pcm_snapshot = bytes(turn.pcm_buffer)
-        segments, info = await run_in_threadpool(
+        transcription = await run_in_threadpool(
             transcribe_pcm16_sync,
-            model=turn.lease_entry.model,
+            runtime=turn.lease_entry.runtime,
             pcm_bytes=pcm_snapshot,
             sample_rate_hz=PCM_SAMPLE_RATE_HZ,
             language=turn.language,
@@ -712,12 +714,20 @@ class RealtimeTranscriptionServer:
             prompt=turn.prompt,
             temperature=0.0,
             word_timestamps=False,
-            vad_filter=turn.vad_filter,
         )
-        text = "".join(segment.text for segment in segments).strip()
+        text = transcription.text.strip()
         turn.last_processed_size = len(pcm_snapshot)
 
         if final:
+            segments = transcription.segments
+            if turn.lease_entry.spec.supports("timestamps") and not segments:
+                segments = await run_in_threadpool(
+                    ensure_timestamp_segments_for_pcm,
+                    lease=turn.lease_entry,
+                    pcm_bytes=pcm_snapshot,
+                    sample_rate_hz=PCM_SAMPLE_RATE_HZ,
+                    transcription=transcription,
+                )
             await self.send_event(
                 "conversation.item.input_audio_transcription.completed",
                 {
@@ -725,7 +735,25 @@ class RealtimeTranscriptionServer:
                     "transcript": text,
                     "model": turn.model_name,
                     "device": turn.lease_entry.actual_device,
-                    "language": info.language,
+                    "language": transcription.info.language,
+                    "segments": [
+                        {
+                            "id": segment.id,
+                            "start": segment.start,
+                            "end": segment.end,
+                            "text": segment.text.strip(),
+                            "words": [
+                                {
+                                    "start": word.start,
+                                    "end": word.end,
+                                    "word": word.word,
+                                    "probability": word.probability,
+                                }
+                                for word in (segment.words or [])
+                            ],
+                        }
+                        for segment in segments
+                    ],
                 },
             )
             turn.closed = True

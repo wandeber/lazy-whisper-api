@@ -3,12 +3,12 @@ from __future__ import annotations
 import base64
 import struct
 import time
-from types import SimpleNamespace
 
 import pytest
 from starlette.websockets import WebSocketDisconnect
 
 import lazy_whisper_api.realtime as realtime_module
+from lazy_whisper_api.backends import BackendTranscription, SegmentTiming, TranscriptionInfo
 from lazy_whisper_api.errors import api_error
 
 from .conftest import TEST_API_KEY, install_fake_lease
@@ -70,9 +70,11 @@ def test_realtime_manual_commit_emits_delta_and_completed(
     def fake_transcribe_pcm16_sync(**kwargs):
         pcm_bytes = kwargs["pcm_bytes"]
         text = "hola" if len(pcm_bytes) < 2400 else "hola mundo"
-        segments = [SimpleNamespace(text=text)]
-        info = SimpleNamespace(language=kwargs["language"] or "es")
-        return segments, info
+        return BackendTranscription(
+            text=text,
+            info=TranscriptionInfo(language=kwargs["language"] or "es", duration=1.0),
+            segments=[SegmentTiming(id=0, start=0.0, end=1.0, text=text)],
+        )
 
     monkeypatch.setattr(realtime_module, "transcribe_pcm16_sync", fake_transcribe_pcm16_sync)
 
@@ -139,7 +141,11 @@ def test_realtime_server_vad_auto_commits(
     install_fake_lease(monkeypatch, app, model_name="turbo")
 
     def fake_transcribe_pcm16_sync(**kwargs):
-        return [SimpleNamespace(text="voz detectada")], SimpleNamespace(language="es")
+        return BackendTranscription(
+            text="voz detectada",
+            info=TranscriptionInfo(language="es", duration=1.0),
+            segments=[SegmentTiming(id=0, start=0.0, end=1.0, text="voz detectada")],
+        )
 
     monkeypatch.setattr(realtime_module, "transcribe_pcm16_sync", fake_transcribe_pcm16_sync)
 
@@ -243,3 +249,27 @@ def test_realtime_turn_unavailable_emits_error_and_keeps_socket_open(
         follow_up = websocket.receive_json()
 
     assert follow_up["type"] == "session.updated"
+
+
+def test_realtime_accepts_qwen_model_selection(client) -> None:
+    with client.websocket_connect(f"/v1/realtime?api_key={TEST_API_KEY}") as websocket:
+        websocket.receive_json()
+        websocket.send_json(
+            {
+                "type": "session.update",
+                "session": {
+                    "type": "transcription",
+                    "audio": {
+                        "input": {
+                            "format": {"type": "audio/pcm", "rate": 24000},
+                            "transcription": {"model": "qwen-0.6b", "language": "es"},
+                            "turn_detection": None,
+                        }
+                    },
+                },
+            }
+        )
+        updated = websocket.receive_json()
+
+    assert updated["type"] == "session.updated"
+    assert updated["session"]["audio"]["input"]["transcription"]["model"] == "qwen3-asr-0.6b"

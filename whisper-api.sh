@@ -20,8 +20,8 @@ do
 done
 shopt -u nullglob
 
-HOST="${WHISPER_API_HOST:-127.0.0.1}"
-PORT="${WHISPER_API_PORT:-43556}"
+HOST="${ASR_API_HOST:-${WHISPER_API_HOST:-127.0.0.1}}"
+PORT="${ASR_API_PORT:-${WHISPER_API_PORT:-43556}}"
 
 exec "$SCRIPT_DIR/.venv/bin/uvicorn" whisper_api:app \
   --app-dir "$SCRIPT_DIR" \

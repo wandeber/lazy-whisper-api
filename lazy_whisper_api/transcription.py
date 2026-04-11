@@ -2,24 +2,23 @@
 
 from __future__ import annotations
 
-import tempfile
-import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from tempfile import NamedTemporaryFile
 
+import av
 from fastapi import HTTPException, UploadFile
 from starlette.concurrency import run_in_threadpool
 
+from .backends import BackendTranscription, SegmentTiming, segments_to_text, write_pcm16_wav
 from .config import Settings
 from .errors import api_error
-from .model_manager import ModelManager
+from .model_manager import LoadedModel, ModelManager
 
 
 SUPPORTED_RESPONSE_FORMATS = {"json", "text", "srt", "verbose_json", "vtt"}
 SUPPORTED_TIMESTAMP_GRANULARITIES = {"segment", "word"}
-PCM16_SAMPLE_WIDTH_BYTES = 2
-PCM16_CHANNELS = 1
 
 
 @dataclass(frozen=True)
@@ -38,7 +37,7 @@ class TranscriptionRequest:
 
 @dataclass(frozen=True)
 class TranscriptionResult:
-    """Raw output returned by Faster Whisper plus request metadata."""
+    """Raw output returned by one ASR backend plus request metadata."""
 
     model_name: str
     device: str
@@ -46,6 +45,16 @@ class TranscriptionResult:
     text: str
     info: Any
     segments: list[Any]
+
+
+def normalize_timestamp_granularities(values: list[str] | None) -> set[str]:
+    """Return a normalized timestamp granularity set."""
+    return set(values or [])
+
+
+def requires_timestamps(*, response_format: str, granularity_set: set[str]) -> bool:
+    """Whether this request needs timestamps in the final response."""
+    return response_format in {"srt", "vtt", "verbose_json"} or bool(granularity_set)
 
 
 def validate_request(settings: Settings, payload: TranscriptionRequest) -> str:
@@ -60,10 +69,24 @@ def validate_request(settings: Settings, payload: TranscriptionRequest) -> str:
             error_type="invalid_request_error",
         ) from exc
 
+    spec = settings.model_settings[canonical_model]
+    if payload.task == "translate" and not spec.supports("translate"):
+        raise api_error(
+            400,
+            f"Model '{payload.model}' does not support translation.",
+            error_type="invalid_request_error",
+        )
+    if payload.task == "transcribe" and not spec.supports("transcribe"):
+        raise api_error(
+            400,
+            f"Model '{payload.model}' does not support transcription.",
+            error_type="invalid_request_error",
+        )
+
     if payload.response_format not in SUPPORTED_RESPONSE_FORMATS:
         raise api_error(400, "Unsupported response_format.", error_type="invalid_request_error")
 
-    granularity_set = set(payload.timestamp_granularities or [])
+    granularity_set = normalize_timestamp_granularities(payload.timestamp_granularities)
     invalid_granularities = granularity_set - SUPPORTED_TIMESTAMP_GRANULARITIES
     if invalid_granularities:
         raise api_error(
@@ -71,18 +94,23 @@ def validate_request(settings: Settings, payload: TranscriptionRequest) -> str:
             "Unsupported timestamp_granularities value.",
             error_type="invalid_request_error",
         )
+    if granularity_set and not spec.supports("timestamps"):
+        raise api_error(
+            400,
+            f"Model '{payload.model}' does not support timestamps.",
+            error_type="invalid_request_error",
+        )
+    if requires_timestamps(
+        response_format=payload.response_format,
+        granularity_set=granularity_set,
+    ) and not spec.supports("timestamps"):
+        raise api_error(
+            400,
+            f"Model '{payload.model}' does not support timestamped responses.",
+            error_type="invalid_request_error",
+        )
 
     return canonical_model
-
-
-def segments_to_text(segments: list[Any]) -> str:
-    """Join transcribed segments into the plain-text response body."""
-    return "".join(segment.text for segment in segments).strip()
-
-
-def normalize_timestamp_granularities(values: list[str] | None) -> set[str]:
-    """Return a normalized timestamp granularity set."""
-    return set(values or [])
 
 
 async def write_upload_to_tempfile(
@@ -100,70 +128,76 @@ async def write_upload_to_tempfile(
             handle.write(chunk)
 
 
+def load_audio_file_as_pcm16(
+    *,
+    audio_path: Path,
+    sample_rate_hz: int,
+) -> bytes:
+    """Decode audio with PyAV and return mono PCM16 bytes at the requested sample rate."""
+    container = av.open(str(audio_path))
+    stream = container.streams.audio[0]
+    resampler = av.audio.resampler.AudioResampler(
+        format="s16",
+        layout="mono",
+        rate=sample_rate_hz,
+    )
+
+    chunks = bytearray()
+    try:
+        for frame in container.decode(stream):
+            for out in resampler.resample(frame):
+                array = out.to_ndarray()
+                chunks.extend(array.astype("int16").tobytes())
+    finally:
+        container.close()
+    return bytes(chunks)
+
+
 def transcribe_sync(
     *,
-    model: Any,
+    runtime: Any,
     audio_path: Path,
     language: str | None,
     task: str,
     prompt: str | None,
     temperature: float,
     word_timestamps: bool,
-    vad_filter: bool,
-) -> tuple[list[Any], Any]:
-    """Run Faster Whisper off the event loop."""
-    segments_iter, info = model.transcribe(
-        str(audio_path),
-        language=language or None,
+) -> BackendTranscription:
+    """Run one backend file transcription off the event loop."""
+    return runtime.transcribe_file(
+        audio_path=audio_path,
+        language=language,
         task=task,
-        initial_prompt=prompt or None,
+        prompt=prompt,
         temperature=temperature,
         word_timestamps=word_timestamps,
-        vad_filter=vad_filter,
     )
-    return list(segments_iter), info
 
 
 def iter_transcribe_sync(
     *,
-    model: Any,
+    runtime: Any,
     audio_path: Path,
     language: str | None,
     task: str,
     prompt: str | None,
     temperature: float,
     word_timestamps: bool,
-    vad_filter: bool,
-) -> tuple[Any, Any]:
-    """Start a Faster Whisper transcription and return its segment iterator."""
-    return model.transcribe(
-        str(audio_path),
-        language=language or None,
+) -> tuple[Any, Any] | None:
+    """Start a native backend streaming transcription when available."""
+    return runtime.iter_transcribe_file(
+        audio_path=audio_path,
+        language=language,
         task=task,
-        initial_prompt=prompt or None,
+        prompt=prompt,
         temperature=temperature,
         word_timestamps=word_timestamps,
-        vad_filter=vad_filter,
     )
-
-
-def write_pcm16_wav(
-    *,
-    pcm_bytes: bytes,
-    sample_rate_hz: int,
-    destination: Path,
-) -> None:
-    """Wrap raw PCM16 mono bytes in a WAV container for Faster Whisper."""
-    with wave.open(str(destination), "wb") as handle:
-        handle.setnchannels(PCM16_CHANNELS)
-        handle.setsampwidth(PCM16_SAMPLE_WIDTH_BYTES)
-        handle.setframerate(sample_rate_hz)
-        handle.writeframes(pcm_bytes)
 
 
 def transcribe_pcm16_sync(
     *,
-    model: Any,
+    runtime: Any,
     pcm_bytes: bytes,
     sample_rate_hz: int,
     language: str | None,
@@ -171,10 +205,55 @@ def transcribe_pcm16_sync(
     prompt: str | None,
     temperature: float,
     word_timestamps: bool,
-    vad_filter: bool,
-) -> tuple[list[Any], Any]:
-    """Transcribe raw PCM16 mono audio by wrapping it in a temporary WAV file."""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+) -> BackendTranscription:
+    """Transcribe raw PCM16 mono audio via the selected backend."""
+    return runtime.transcribe_pcm(
+        pcm_bytes=pcm_bytes,
+        sample_rate_hz=sample_rate_hz,
+        language=language,
+        task=task,
+        prompt=prompt,
+        temperature=temperature,
+        word_timestamps=word_timestamps,
+    )
+
+
+def ensure_timestamp_segments(
+    *,
+    lease: LoadedModel,
+    audio_path: Path,
+    transcription: BackendTranscription,
+) -> list[SegmentTiming]:
+    """Return timestamped segments, using the backend aligner when needed."""
+    if transcription.segments:
+        return transcription.segments
+    if not transcription.text.strip():
+        return []
+    if not transcription.info.language:
+        return []
+    return lease.runtime.align_file(
+        audio_path=audio_path,
+        text=transcription.text,
+        language=transcription.info.language,
+    )
+
+
+def ensure_timestamp_segments_for_pcm(
+    *,
+    lease: LoadedModel,
+    pcm_bytes: bytes,
+    sample_rate_hz: int,
+    transcription: BackendTranscription,
+) -> list[SegmentTiming]:
+    """Align PCM audio when the backend only returns final text."""
+    if transcription.segments:
+        return transcription.segments
+    if not transcription.text.strip():
+        return []
+    if not transcription.info.language:
+        return []
+
+    with NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
         tmp_path = Path(tmp.name)
 
     try:
@@ -183,15 +262,10 @@ def transcribe_pcm16_sync(
             sample_rate_hz=sample_rate_hz,
             destination=tmp_path,
         )
-        return transcribe_sync(
-            model=model,
+        return lease.runtime.align_file(
             audio_path=tmp_path,
-            language=language,
-            task=task,
-            prompt=prompt,
-            temperature=temperature,
-            word_timestamps=word_timestamps,
-            vad_filter=vad_filter,
+            text=transcription.text,
+            language=transcription.info.language,
         )
     finally:
         tmp_path.unlink(missing_ok=True)
@@ -203,11 +277,13 @@ async def transcribe_upload(
     model_manager: ModelManager,
     payload: TranscriptionRequest,
 ) -> TranscriptionResult:
-    """Persist the upload temporarily, run Faster Whisper, and clean up."""
+    """Persist the upload temporarily, run one backend, and clean up."""
     canonical_model = validate_request(settings, payload)
 
     suffix = Path(payload.file.filename or "upload.bin").suffix
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+    from tempfile import NamedTemporaryFile
+
+    with NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp_path = Path(tmp.name)
 
     try:
@@ -218,21 +294,32 @@ async def transcribe_upload(
         )
 
         granularity_set = normalize_timestamp_granularities(payload.timestamp_granularities)
+        wants_timestamps = requires_timestamps(
+            response_format=payload.response_format,
+            granularity_set=granularity_set,
+        )
         with model_manager.lease(canonical_model) as lease:
-            if lease.model is None:
+            if lease.runtime is None:
                 raise RuntimeError(f"Model '{canonical_model}' is not loaded.")
-            segments, info = await run_in_threadpool(
+            transcription = await run_in_threadpool(
                 transcribe_sync,
-                model=lease.model,
+                runtime=lease.runtime,
                 audio_path=tmp_path,
                 language=payload.language or None,
                 task=payload.task,
                 prompt=payload.prompt or None,
                 temperature=payload.temperature,
-                word_timestamps="word" in granularity_set,
-                vad_filter=lease.spec.vad_filter,
+                word_timestamps=("word" in granularity_set) and lease.spec.family == "whisper",
             )
-            text = segments_to_text(segments)
+            segments = transcription.segments
+            if wants_timestamps:
+                segments = await run_in_threadpool(
+                    ensure_timestamp_segments,
+                    lease=lease,
+                    audio_path=tmp_path,
+                    transcription=transcription,
+                )
+            text = transcription.text or segments_to_text(segments)
             device = lease.actual_device
     except HTTPException:
         raise
@@ -247,6 +334,6 @@ async def transcribe_upload(
         device=device,
         response_format=payload.response_format,
         text=text,
-        info=info,
+        info=transcription.info,
         segments=segments,
     )

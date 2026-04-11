@@ -30,8 +30,8 @@ load_env_file() {
   source "$ENV_FILE"
   set +a
 
-  STATUS_HOST="${WHISPER_API_HOST:-127.0.0.1}"
-  STATUS_PORT="${WHISPER_API_PORT:-43556}"
+  STATUS_HOST="${ASR_API_HOST:-${WHISPER_API_HOST:-127.0.0.1}}"
+  STATUS_PORT="${ASR_API_PORT:-${WHISPER_API_PORT:-43556}}"
 
   if [[ "$STATUS_HOST" == "0.0.0.0" ]]; then
     STATUS_HOST="127.0.0.1"
@@ -50,7 +50,7 @@ env_file = Path(sys.argv[3])
 
 unit_path.write_text(
     f"""[Unit]
-Description=Local Whisper API
+Description=Local ASR API
 After=network-online.target
 Wants=network-online.target
 
@@ -95,8 +95,9 @@ wait_until_ready() {
   local attempt
   local -a curl_args=(-fsS)
 
-  if [[ -n "${WHISPER_API_KEY:-}" ]]; then
-    curl_args+=(-H "Authorization: Bearer ${WHISPER_API_KEY}")
+  local api_key="${ASR_API_KEY:-${WHISPER_API_KEY:-}}"
+  if [[ -n "$api_key" ]]; then
+    curl_args+=(-H "Authorization: Bearer ${api_key}")
   fi
 
   for attempt in $(seq 1 60); do
