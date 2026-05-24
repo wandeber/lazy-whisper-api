@@ -44,7 +44,11 @@ class ModelManager:
         self._loaded: dict[str, LoadedModel] = {}
 
     def _device_family(self, device: str) -> str:
-        return "cuda" if device.startswith("cuda") else "cpu"
+        if device.startswith("cuda"):
+            return "cuda"
+        if device.startswith("mlx"):
+            return "mlx"
+        return "cpu"
 
     def _loaded_for_family_locked(self, device_family: str) -> list[LoadedModel]:
         return [
@@ -98,6 +102,9 @@ class ModelManager:
                         ),
                         error_type="server_busy",
                     )
+            return
+
+        if device_family != "cpu":
             return
 
         loaded_cpu_models = self._loaded_for_family_locked("cpu")

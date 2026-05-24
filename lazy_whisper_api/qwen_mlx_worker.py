@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
-"""Standalone qwen-asr worker process for the main API."""
+"""Standalone mlx-qwen3-asr worker process for Apple Silicon.
+
+This worker intentionally mirrors the JSON-RPC protocol used by the CUDA
+`qwen_worker.py`. The main API can therefore keep one OpenAI-compatible surface
+while selecting either the PyTorch/CUDA or MLX/Metal runtime from configuration.
+"""
 
 from __future__ import annotations
 
 import argparse
 import base64
-import io
 import json
 import os
 import sys
+import tempfile
+import wave
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-import soundfile as sf
-import torch
-from qwen_asr import Qwen3ASRModel, Qwen3ForcedAligner
 
-
-QWEN_SAMPLE_RATE_HZ = 16_000
+PCM16_SAMPLE_WIDTH_BYTES = 2
+PCM16_CHANNELS = 1
 MAX_SEGMENT_CHARS = 84
 MAX_SEGMENT_SECONDS = 6.0
 HARD_MAX_SEGMENT_SECONDS = 8.0
@@ -36,24 +38,39 @@ def encode_json(payload: dict[str, Any]) -> None:
     sys.stdout.flush()
 
 
-def torch_dtype_from_name(name: str) -> torch.dtype:
+def write_pcm16_wav(
+    *,
+    pcm_bytes: bytes,
+    sample_rate_hz: int,
+    destination: Path,
+) -> None:
+    """Write realtime PCM snapshots to a WAV file accepted by mlx-qwen3-asr."""
+    with wave.open(str(destination), "wb") as handle:
+        handle.setnchannels(PCM16_CHANNELS)
+        handle.setsampwidth(PCM16_SAMPLE_WIDTH_BYTES)
+        handle.setframerate(sample_rate_hz)
+        handle.writeframes(pcm_bytes)
+
+
+def mlx_dtype_from_name(name: str) -> Any:
+    """Resolve the configured dtype after importing MLX inside the worker venv."""
+    import mlx.core as mx
+
     normalized = name.strip().lower()
     if normalized in {"float16", "fp16", "half"}:
-        return torch.float16
+        return mx.float16
     if normalized in {"bfloat16", "bf16"}:
-        return torch.bfloat16
+        return mx.bfloat16
     if normalized in {"float32", "fp32", "float"}:
-        return torch.float32
-    raise ValueError(f"Unsupported torch dtype: {name}")
+        return mx.float32
+    raise ValueError(f"Unsupported MLX dtype: {name}")
 
 
-def normalize_device_map(device: str) -> str:
-    normalized = device.strip().lower()
-    if normalized.startswith("cuda"):
-        return "cuda"
-    if normalized.startswith("cpu"):
-        return "cpu"
-    return device
+def value_from(item: Any, key: str, default: Any = None) -> Any:
+    """Read from either dict-like MLX payloads or lightweight result objects."""
+    if isinstance(item, dict):
+        return item.get(key, default)
+    return getattr(item, key, default)
 
 
 @dataclass(frozen=True)
@@ -64,30 +81,48 @@ class WordPayload:
     probability: float | None = None
 
 
-def audio_duration_seconds(audio_path: str) -> float:
-    info = sf.info(audio_path)
-    return float(info.frames) / float(info.samplerate)
+def duration_from_timing_items(items: list[Any], fallback: float = 0.0) -> float:
+    """Estimate duration from returned chunks/segments without extra audio deps."""
+    ends = [float(value_from(item, "end", 0.0) or 0.0) for item in items]
+    return max(ends, default=fallback)
 
 
-def pcm16_to_float32(pcm_bytes: bytes) -> np.ndarray:
-    pcm = np.frombuffer(pcm_bytes, dtype=np.int16)
-    return pcm.astype(np.float32) / 32768.0
-
-
-def align_items_to_segments(text: str, items: list[Any]) -> list[dict[str, Any]]:
-    if not items:
-        return []
-    words = [
-        asdict(
-            WordPayload(
-                start=float(item.start_time),
-                end=float(item.end_time),
-                word=str(item.text),
+def normalize_word_items(items: list[Any]) -> list[dict[str, Any]]:
+    """Normalize MLX timestamp items into the existing worker word payload shape."""
+    words: list[dict[str, Any]] = []
+    for item in items:
+        text = str(value_from(item, "text", value_from(item, "word", ""))).strip()
+        if not text:
+            continue
+        words.append(
+            asdict(
+                WordPayload(
+                    start=float(value_from(item, "start", 0.0) or 0.0),
+                    end=float(value_from(item, "end", 0.0) or 0.0),
+                    word=text,
+                    probability=value_from(item, "probability"),
+                )
             )
         )
-        for item in items
-    ]
-    return words_to_timestamp_segments(words)
+    return words
+
+
+def chunks_to_segments(chunks: list[Any]) -> list[dict[str, Any]]:
+    """Normalize MLX chunk dictionaries into this API's segment schema."""
+    segments: list[dict[str, Any]] = []
+    for index, chunk in enumerate(chunks):
+        text = str(value_from(chunk, "text", "")).strip()
+        if not text:
+            continue
+        segments.append(
+            {
+                "id": int(value_from(chunk, "id", value_from(chunk, "chunk_index", index)) or index),
+                "start": float(value_from(chunk, "start", 0.0) or 0.0),
+                "end": float(value_from(chunk, "end", 0.0) or 0.0),
+                "text": text,
+            }
+        )
+    return segments
 
 
 def word_text(word: dict[str, Any]) -> str:
@@ -107,10 +142,10 @@ def should_start_new_segment(
 ) -> bool:
     """Decide whether a word-level alignment should become a subtitle boundary.
 
-    Qwen's forced aligner gives precise word timings. SRT/VTT clients, however,
-    need human-readable segments rather than one huge block. These heuristics
-    keep word timestamps intact while splitting on long pauses, sentence-like
-    punctuation, and practical subtitle size limits.
+    mlx-qwen3-asr returns precise aligned timestamp items, which are ideal for
+    verbose JSON word timings but too granular for SRT/VTT on their own. These
+    conservative boundaries keep the word timings intact while producing
+    readable subtitle-sized segments from pauses, punctuation, and length caps.
     """
     if not current_words:
         return False
@@ -179,70 +214,45 @@ class Worker:
         device: str,
         dtype_name: str,
         aligner_source: str | None,
-        aligner_device: str,
-        aligner_dtype_name: str,
     ) -> None:
         self.model_name = model_name
         self.model_source = model_source
         self.device = device
-        self.dtype = torch_dtype_from_name(dtype_name)
+        self.dtype_name = dtype_name
         self.aligner_source = aligner_source or None
-        self.aligner_device = aligner_device
-        self.aligner_dtype = torch_dtype_from_name(aligner_dtype_name)
-        self.model = self._load_model()
-        self.aligner: Qwen3ForcedAligner | None = None
+        self.session = self._load_session()
 
-    def _load_model(self) -> Qwen3ASRModel:
-        log(
-            f"Loading qwen-asr model={self.model_name} source={self.model_source} "
-            f"device={self.device} dtype={self.dtype}"
-        )
-        return Qwen3ASRModel.from_pretrained(
-            self.model_source,
-            torch_dtype=self.dtype,
-            device_map=normalize_device_map(self.device),
-            max_inference_batch_size=1,
-        )
+    def _load_session(self) -> Any:
+        from mlx_qwen3_asr import Session
 
-    def _load_aligner(self) -> Qwen3ForcedAligner:
-        if self.aligner is not None:
-            return self.aligner
-        if not self.aligner_source:
-            raise RuntimeError(
-                f"Model '{self.model_name}' was asked for timestamps but no aligner was configured."
-            )
         log(
-            f"Loading qwen aligner source={self.aligner_source} "
-            f"device={self.aligner_device} dtype={self.aligner_dtype}"
+            f"Loading mlx-qwen3-asr model={self.model_name} source={self.model_source} "
+            f"device={self.device} dtype={self.dtype_name}"
         )
-        self.aligner = Qwen3ForcedAligner.from_pretrained(
-            self.aligner_source,
-            torch_dtype=self.aligner_dtype,
-            device_map=normalize_device_map(self.aligner_device),
+        return Session(
+            model=self.model_source,
+            dtype=mlx_dtype_from_name(self.dtype_name),
         )
-        return self.aligner
 
     def _transcribe(
         self,
         *,
-        audio: Any,
-        duration: float,
+        audio: str,
         language: str | None,
         prompt: str | None,
-    ) -> dict[str, Any]:
-        result = self.model.transcribe(
-            audio=audio,
+        return_timestamps: bool,
+    ) -> Any:
+        # `forced_aligner` is only provided for timestamped requests. Keeping it
+        # off the normal path avoids loading the aligner until the public API
+        # actually needs verbose_json/SRT/VTT/segment data.
+        return self.session.transcribe(
+            audio,
             context=prompt or "",
             language=language,
-            return_time_stamps=False,
-        )[0]
-        return {
-            "text": str(result.text).strip(),
-            "language": str(result.language),
-            "duration": duration,
-            "language_probability": None,
-            "segments": [],
-        }
+            return_timestamps=return_timestamps,
+            return_chunks=True,
+            forced_aligner=self.aligner_source if return_timestamps else None,
+        )
 
     def transcribe_file(
         self,
@@ -252,12 +262,22 @@ class Worker:
         prompt: str | None,
         temperature: float | None = None,
     ) -> dict[str, Any]:
-        return self._transcribe(
+        result = self._transcribe(
             audio=audio_path,
-            duration=audio_duration_seconds(audio_path),
             language=language,
             prompt=prompt,
+            return_timestamps=False,
         )
+        chunks = list(value_from(result, "chunks", []) or [])
+        return {
+            "text": str(value_from(result, "text", "")).strip(),
+            "language": str(value_from(result, "language", language or "")),
+            "duration": duration_from_timing_items(chunks),
+            "language_probability": None,
+            # Match the CUDA Qwen worker: timestamps are populated through
+            # align_file only when the public request needs them.
+            "segments": [],
+        }
 
     def transcribe_pcm(
         self,
@@ -269,14 +289,24 @@ class Worker:
         temperature: float | None = None,
     ) -> dict[str, Any]:
         pcm_bytes = base64.b64decode(pcm_base64)
-        waveform = pcm16_to_float32(pcm_bytes)
-        duration = len(waveform) / float(sample_rate_hz)
-        return self._transcribe(
-            audio=(waveform, sample_rate_hz),
-            duration=duration,
-            language=language,
-            prompt=prompt,
-        )
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            write_pcm16_wav(
+                pcm_bytes=pcm_bytes,
+                sample_rate_hz=sample_rate_hz,
+                destination=tmp_path,
+            )
+            result = self.transcribe_file(
+                audio_path=str(tmp_path),
+                language=language,
+                prompt=prompt,
+                temperature=temperature,
+            )
+            result["duration"] = len(pcm_bytes) / float(sample_rate_hz * PCM16_SAMPLE_WIDTH_BYTES)
+            return result
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
     def align_file(
         self,
@@ -285,28 +315,31 @@ class Worker:
         text: str,
         language: str,
     ) -> dict[str, Any]:
-        aligner = self._load_aligner()
-        result = aligner.align(
+        result = self._transcribe(
             audio=audio_path,
-            text=text,
             language=language,
-        )[0]
-        segments = align_items_to_segments(text, list(result.items))
+            prompt=text,
+            return_timestamps=True,
+        )
+        timestamp_items = list(value_from(result, "segments", []) or [])
+        chunks = list(value_from(result, "chunks", []) or [])
+        words = normalize_word_items(timestamp_items)
+        segments = words_to_timestamp_segments(words) or chunks_to_segments(chunks)
         return {
-            "duration": audio_duration_seconds(audio_path),
+            "duration": duration_from_timing_items(timestamp_items or chunks),
             "segments": segments,
         }
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="qwen-asr sidecar worker")
+    parser = argparse.ArgumentParser(description="mlx-qwen3-asr sidecar worker")
     parser.add_argument("--model-name", required=True)
     parser.add_argument("--model-source", required=True)
     parser.add_argument("--device", required=True)
     parser.add_argument("--dtype", required=True)
     parser.add_argument("--aligner-source", default="")
-    parser.add_argument("--aligner-device", default="cpu")
-    parser.add_argument("--aligner-dtype", default="float32")
+    parser.add_argument("--aligner-device", default="")
+    parser.add_argument("--aligner-dtype", default="")
     return parser.parse_args()
 
 
@@ -319,8 +352,6 @@ def main() -> int:
             device=args.device,
             dtype_name=args.dtype,
             aligner_source=args.aligner_source or None,
-            aligner_device=args.aligner_device,
-            aligner_dtype_name=args.aligner_dtype,
         )
     except Exception as exc:
         encode_json(

@@ -15,4 +15,4 @@ fi
 "$QWEN_VENV/bin/pip" install --upgrade pip setuptools wheel
 "$QWEN_VENV/bin/pip" install -r "$SCRIPT_DIR/requirements-qwen-cu126.txt"
 
-echo "Qwen runtime listo en $QWEN_VENV"
+echo "Qwen CUDA runtime ready at $QWEN_VENV"

@@ -1,6 +1,7 @@
 .env
 .venv/
 .venv-qwen/
+.venv-qwen-mlx/
 .cache/
 models/
 __pycache__/

@@ -31,7 +31,7 @@ Relevant file:
 
 - [lazy_whisper_api/backends.py](/home/wandeber/codex-playground/lazy_whisper_api/backends.py)
 
-### Qwen backend
+### Qwen backends
 
 Qwen-family models live in a separate Python runtime with a separate dependency set.
 
@@ -39,10 +39,15 @@ Relevant files:
 
 - [lazy_whisper_api/backends.py](/home/wandeber/codex-playground/lazy_whisper_api/backends.py)
 - [lazy_whisper_api/qwen_worker.py](/home/wandeber/codex-playground/lazy_whisper_api/qwen_worker.py)
+- [lazy_whisper_api/qwen_mlx_worker.py](/home/wandeber/codex-playground/lazy_whisper_api/qwen_mlx_worker.py)
 - [setup-qwen-runtime.sh](/home/wandeber/codex-playground/setup-qwen-runtime.sh)
+- [setup-qwen-mlx-runtime.sh](/home/wandeber/codex-playground/setup-qwen-mlx-runtime.sh)
 - [requirements-qwen-cu126.txt](/home/wandeber/codex-playground/requirements-qwen-cu126.txt)
+- [requirements-qwen-mlx.txt](/home/wandeber/codex-playground/requirements-qwen-mlx.txt)
 
 The main API talks to each Qwen worker over line-delimited JSON-RPC on `stdin/stdout`.
+`qwen-worker` runs the existing PyTorch/CUDA `qwen-asr` runtime. `qwen-mlx-worker`
+runs `mlx-qwen3-asr` on Apple Silicon. Both expose the same public model aliases.
 
 ## Model abstraction
 
@@ -59,6 +64,8 @@ Each configured model has:
 - `max_concurrent_requests`
 
 That configuration is produced in [lazy_whisper_api/config.py](/home/wandeber/codex-playground/lazy_whisper_api/config.py) from `ASR_*` variables, with `WHISPER_*` preserved as legacy aliases.
+Worker Python paths can be configured by family with `ASR_FAMILY_RUNTIME_PYTHON_MAP`
+or by canonical model with `ASR_MODEL_RUNTIME_PYTHON_MAP`.
 
 ## Request flow
 
@@ -122,6 +129,12 @@ Supported server events:
 - each model has a configured reservation
 - default machine budget: `8192 MB`
 
+### MLX
+
+- Apple Silicon models use the `mlx` device family
+- MLX models do not share the CPU loaded-model limit
+- concurrency is still enforced per model
+
 Eviction rule:
 
 - if a new model needs space, the oldest idle model on the same device family is unloaded first
@@ -139,6 +152,6 @@ The first Qwen request is more expensive than a Whisper request because it may n
 
 - download model files from Hugging Face
 - start the isolated worker process
-- load weights on GPU
+- load weights on CUDA or Apple Silicon GPU
 
 Once loaded, Qwen follows the same idle-unload policy as the other models.

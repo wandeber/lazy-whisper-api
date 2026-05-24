@@ -153,6 +153,23 @@ def test_translation_stream_true_is_rejected(
     }
 
 
+def test_qwen_translation_is_rejected(
+    client,
+    auth_headers,
+    sample_upload,
+) -> None:
+    response = client.post(
+        "/v1/audio/translations",
+        headers=auth_headers,
+        files=sample_upload,
+        data={"model": "qwen-0.6b"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert "does not support translation" in response.json()["error"]["message"]
+
+
 def test_transcription_stream_true_uses_synthetic_qwen_path(
     app,
     client,

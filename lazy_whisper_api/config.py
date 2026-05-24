@@ -78,7 +78,10 @@ def normalize_pathish(raw_value: str, project_root: Path) -> str:
         or (project_root / raw_value).exists()
     ):
         if not candidate.is_absolute():
-            candidate = (project_root / candidate).resolve()
+            # Keep virtualenv interpreter symlinks intact. Executing the real
+            # Homebrew/Python target would bypass the venv site-packages, which
+            # breaks isolated worker runtimes such as `.venv-qwen-mlx`.
+            candidate = (project_root / candidate).absolute()
         return str(candidate)
     return raw_value
 
@@ -284,6 +287,17 @@ def load_settings() -> Settings:
             or ""
         ).items()
     }
+    model_runtime_python_map = {
+        key: normalize_pathish(value, PROJECT_ROOT)
+        for key, value in parse_mapping(
+            getenv_alias(
+                "ASR_MODEL_RUNTIME_PYTHON_MAP",
+                None,
+                "",
+            )
+            or ""
+        ).items()
+    }
     model_gpu_memory_map = parse_int_mapping(
         getenv_alias(
             "ASR_MODEL_GPU_MEMORY_RESERVATION_MB_MAP",
@@ -348,7 +362,10 @@ def load_settings() -> Settings:
             idle_seconds=model_idle_seconds_map.get(model_name, 5400),
             capabilities=model_capabilities_map.get(model_name, frozenset({"transcribe"})),
             vad_filter=model_vad_map.get(model_name, False),
-            runtime_python=family_runtime_python_map.get(model_family_map.get(model_name, "whisper")),
+            runtime_python=(
+                model_runtime_python_map.get(model_name)
+                or family_runtime_python_map.get(model_family_map.get(model_name, "whisper"))
+            ),
             gpu_memory_reservation_mb=model_gpu_memory_map.get(model_name, 0),
             max_concurrent_requests=model_concurrency_map.get(
                 model_name,

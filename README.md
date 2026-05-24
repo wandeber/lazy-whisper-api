@@ -46,13 +46,16 @@ Backend:
 
 Backend:
 
-- isolated `qwen-asr` worker runtime
+- isolated worker runtime selected by config:
+  - `qwen-worker` for NVIDIA/CUDA through `qwen-asr`
+  - `qwen-mlx-worker` for Apple Silicon through `mlx-qwen3-asr`
 
 Notes:
 
 - Qwen is transcription-only in this project for now
-- Qwen timestamps are produced with `Qwen/Qwen3-ForcedAligner-0.6B`
-- on this GTX 1070 setup, Qwen is configured for `float16` on GPU and the aligner stays on CPU by default
+- Qwen timestamps are produced with `Qwen/Qwen3-ForcedAligner-0.6B`; aligned
+  words are grouped into readable segments for `verbose_json`, `srt`, and `vtt`
+- clients use the same model aliases on CUDA and Apple Silicon: `qwen-0.6b` and `qwen-1.7b`
 
 ## Resource policy
 
@@ -82,11 +85,14 @@ Default reservations in [.env.example](/home/wandeber/codex-playground/.env.exam
 - [lazy_whisper_api/transcription.py](/home/wandeber/codex-playground/lazy_whisper_api/transcription.py): validation, uploads, decoding, and timestamp alignment helpers
 - [lazy_whisper_api/streaming.py](/home/wandeber/codex-playground/lazy_whisper_api/streaming.py): SSE transcription streaming
 - [lazy_whisper_api/realtime.py](/home/wandeber/codex-playground/lazy_whisper_api/realtime.py): realtime transcription-only WebSocket server
-- [lazy_whisper_api/qwen_worker.py](/home/wandeber/codex-playground/lazy_whisper_api/qwen_worker.py): isolated Qwen sidecar worker
+- [lazy_whisper_api/qwen_worker.py](/home/wandeber/codex-playground/lazy_whisper_api/qwen_worker.py): isolated Qwen CUDA sidecar worker
+- [lazy_whisper_api/qwen_mlx_worker.py](/home/wandeber/codex-playground/lazy_whisper_api/qwen_mlx_worker.py): isolated Qwen Apple Silicon sidecar worker
 - [whisper-api.sh](/home/wandeber/codex-playground/whisper-api.sh): launcher
 - [whisper-service.sh](/home/wandeber/codex-playground/whisper-service.sh): persistent `systemd --user` controller
-- [setup-qwen-runtime.sh](/home/wandeber/codex-playground/setup-qwen-runtime.sh): creates and installs the isolated Qwen runtime
+- [setup-qwen-runtime.sh](/home/wandeber/codex-playground/setup-qwen-runtime.sh): creates and installs the isolated Qwen CUDA runtime
+- [setup-qwen-mlx-runtime.sh](/home/wandeber/codex-playground/setup-qwen-mlx-runtime.sh): creates and installs the isolated Qwen Apple Silicon runtime
 - [requirements-qwen-cu126.txt](/home/wandeber/codex-playground/requirements-qwen-cu126.txt): Qwen runtime dependencies for CUDA 12.6
+- [requirements-qwen-mlx.txt](/home/wandeber/codex-playground/requirements-qwen-mlx.txt): Qwen runtime dependencies for Apple Silicon
 - [docs/architecture.md](/home/wandeber/codex-playground/docs/architecture.md): deeper runtime notes
 - [docs/benchmarks.md](/home/wandeber/codex-playground/docs/benchmarks.md): machine-specific benchmark notes for the classic endpoint
 
@@ -102,22 +108,26 @@ Those numbers are machine-specific and should be read as relative guidance, not 
 
 ## Installation
 
-Install the main API runtime:
+Install the main API runtime. On NVIDIA/CUDA machines:
 
 ```bash
 make install-gpu
+make install-qwen-cuda-runtime
+cp .env.cuda.example .env
 ```
 
-Install the isolated Qwen runtime:
+On Apple Silicon:
+
+```bash
+make install-macos
+make install-qwen-mlx-runtime
+cp .env.apple.example .env
+```
+
+The legacy Qwen target still points at the CUDA runtime:
 
 ```bash
 make install-qwen-runtime
-```
-
-Create local config:
-
-```bash
-cp .env.example .env
 ```
 
 Set at least:
@@ -156,6 +166,7 @@ Important settings:
 - `ASR_MODEL_ALIGNER_DEVICE_MAP`
 - `ASR_MODEL_ALIGNER_DTYPE_MAP`
 - `ASR_FAMILY_RUNTIME_PYTHON_MAP`
+- `ASR_MODEL_RUNTIME_PYTHON_MAP`
 - `ASR_GPU_MEMORY_BUDGET_MB`
 
 Shell note:
@@ -167,14 +178,14 @@ Shell note:
 Health:
 
 ```bash
-curl http://127.0.0.1:43556/healthz \
+curl http://localhost:43556/healthz \
   -H "Authorization: Bearer your-api-key"
 ```
 
 Classic transcription:
 
 ```bash
-curl -X POST http://127.0.0.1:43556/v1/audio/transcriptions \
+curl -X POST http://localhost:43556/v1/audio/transcriptions \
   -H "Authorization: Bearer your-api-key" \
   -F file=@audio.mp3 \
   -F model=whisper-1
@@ -183,16 +194,19 @@ curl -X POST http://127.0.0.1:43556/v1/audio/transcriptions \
 Qwen transcription:
 
 ```bash
-curl -X POST http://127.0.0.1:43556/v1/audio/transcriptions \
+curl -X POST http://localhost:43556/v1/audio/transcriptions \
   -H "Authorization: Bearer your-api-key" \
   -F file=@audio.mp3 \
-  -F model=qwen-0.6b
+  -F model=qwen-1.7b
 ```
+
+Use `qwen-1.7b` for best transcription quality and `qwen-0.6b` when startup
+time, memory, or disk use matter more than the last bit of accuracy.
 
 Completed-audio streaming:
 
 ```bash
-curl --no-buffer -X POST http://127.0.0.1:43556/v1/audio/transcriptions \
+curl --no-buffer -X POST http://localhost:43556/v1/audio/transcriptions \
   -H "Authorization: Bearer your-api-key" \
   -F file=@audio.mp3 \
   -F model=whisper-1 \
@@ -212,7 +226,7 @@ API_KEY = "your-api-key"
 
 async def main():
     async with websockets.connect(
-        "ws://127.0.0.1:43556/v1/realtime",
+        "ws://localhost:43556/v1/realtime",
         additional_headers={"Authorization": f"Bearer {API_KEY}"},
     ) as ws:
         print(json.loads(await ws.recv()))

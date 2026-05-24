@@ -25,7 +25,11 @@ from .config import ModelSettings, Settings
 
 
 LOGGER = logging.getLogger("whisper_api")
-QWEN_WORKER_PATH = Path(__file__).resolve().parent / "qwen_worker.py"
+QWEN_CUDA_WORKER_PATH = Path(__file__).resolve().parent / "qwen_worker.py"
+QWEN_MLX_WORKER_PATH = Path(__file__).resolve().parent / "qwen_mlx_worker.py"
+# Keep the old constant as a compatibility affordance for any local imports or
+# tests that may reference it directly.
+QWEN_WORKER_PATH = QWEN_CUDA_WORKER_PATH
 QWEN_LANGUAGE_MAP = {
     "ar": "Arabic",
     "cs": "Czech",
@@ -388,14 +392,24 @@ class WhisperRuntime(RuntimeHandle):
 
 
 class QwenWorkerProxy(RuntimeHandle):
-    """Proxy object that talks to a dedicated qwen-asr worker process."""
+    """Proxy object that talks to a dedicated Qwen worker process."""
 
     preferred_stream_sample_rate_hz = QWEN_DEFAULT_SAMPLE_RATE_HZ
 
-    def __init__(self, *, spec: ModelSettings, settings: Settings, device: str) -> None:
+    def __init__(
+        self,
+        *,
+        spec: ModelSettings,
+        settings: Settings,
+        device: str,
+        worker_path: Path = QWEN_CUDA_WORKER_PATH,
+        worker_label: str = "qwen-worker",
+    ) -> None:
         super().__init__(spec=spec, settings=settings, device=device)
         self._io_lock = threading.RLock()
         self._stderr_thread: threading.Thread | None = None
+        self.worker_path = worker_path
+        self.worker_label = worker_label
         python_path = spec.runtime_python
         if not python_path:
             raise RuntimeError(
@@ -418,7 +432,7 @@ class QwenWorkerProxy(RuntimeHandle):
 
         args = [
             str(runtime_python),
-            str(QWEN_WORKER_PATH),
+            str(worker_path),
             "--model-name",
             spec.name,
             "--model-source",
@@ -455,12 +469,12 @@ class QwenWorkerProxy(RuntimeHandle):
         def drain() -> None:
             assert self.process.stderr is not None
             for line in self.process.stderr:
-                LOGGER.info("[qwen-worker:%s] %s", self.spec.name, line.rstrip())
+                LOGGER.info("[%s:%s] %s", self.worker_label, self.spec.name, line.rstrip())
 
         self._stderr_thread = threading.Thread(
             target=drain,
             daemon=True,
-            name=f"qwen-worker-stderr-{self.spec.name}",
+            name=f"{self.worker_label}-stderr-{self.spec.name}",
         )
         self._stderr_thread.start()
 
@@ -655,10 +669,24 @@ def build_runtime(
     device: str,
 ) -> RuntimeHandle:
     """Build one runtime handle for a model spec."""
-    if spec.family == "whisper":
+    if spec.backend == "faster-whisper":
         return WhisperRuntime(spec=spec, settings=settings, device=device)
-    if spec.family == "qwen":
-        return QwenWorkerProxy(spec=spec, settings=settings, device=device)
+    if spec.backend == "qwen-worker":
+        return QwenWorkerProxy(
+            spec=spec,
+            settings=settings,
+            device=device,
+            worker_path=QWEN_CUDA_WORKER_PATH,
+            worker_label="qwen-worker",
+        )
+    if spec.backend == "qwen-mlx-worker":
+        return QwenWorkerProxy(
+            spec=spec,
+            settings=settings,
+            device=device,
+            worker_path=QWEN_MLX_WORKER_PATH,
+            worker_label="qwen-mlx-worker",
+        )
     raise RuntimeError(
-        f"Unsupported model family '{spec.family}' for model '{spec.name}'."
+        f"Unsupported backend '{spec.backend}' for model '{spec.name}'."
     )

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
 
+import lazy_whisper_api.backends as backends_module
 import lazy_whisper_api.model_manager as model_manager_module
 from lazy_whisper_api.config import load_settings
 from lazy_whisper_api.model_manager import ModelManager
@@ -23,6 +25,41 @@ def test_settings_resolve_qwen_alias_and_capabilities(app) -> None:
     assert spec.supports("stream")
     assert spec.supports("realtime")
     assert spec.runtime_python.endswith(".venv-qwen/bin/python")
+
+
+def test_model_runtime_python_map_allows_apple_silicon_qwen_backend(
+    app,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "ASR_MODEL_BACKEND_MAP",
+        (
+            "turbo=faster-whisper,"
+            "large-v3=faster-whisper,"
+            "distil-multi4=faster-whisper,"
+            "qwen3-asr-0.6b=qwen-mlx-worker,"
+            "qwen3-asr-1.7b=qwen-mlx-worker"
+        ),
+    )
+    monkeypatch.setenv(
+        "ASR_MODEL_DEVICE_MAP",
+        "turbo=cpu,large-v3=cpu,distil-multi4=cpu,qwen3-asr-0.6b=mlx,qwen3-asr-1.7b=mlx",
+    )
+    monkeypatch.setenv(
+        "ASR_MODEL_RUNTIME_PYTHON_MAP",
+        (
+            "qwen3-asr-0.6b=./.venv-qwen-mlx/bin/python,"
+            "qwen3-asr-1.7b=./.venv-qwen-mlx/bin/python"
+        ),
+    )
+
+    settings = load_settings()
+
+    assert settings.resolve_model_name("qwen-0.6b") == "qwen3-asr-0.6b"
+    spec = settings.model_settings["qwen3-asr-0.6b"]
+    assert spec.backend == "qwen-mlx-worker"
+    assert spec.preferred_device == "mlx"
+    assert spec.runtime_python.endswith(".venv-qwen-mlx/bin/python")
 
 
 def test_legacy_whisper_env_aliases_still_load(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -47,7 +84,11 @@ def test_legacy_whisper_env_aliases_still_load(monkeypatch: pytest.MonkeyPatch) 
     assert settings.resolve_model_name("whisper-1") == "turbo"
 
 
-def test_cuda_preferred_device_uses_backend_safe_name(app) -> None:
+def test_cuda_preferred_device_uses_backend_safe_name(
+    app,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(model_manager_module.torch.cuda, "is_available", lambda: True)
     manager = ModelManager(app.state.settings)
     spec = replace(
         app.state.settings.model_settings["turbo"],
@@ -55,6 +96,54 @@ def test_cuda_preferred_device_uses_backend_safe_name(app) -> None:
     )
 
     assert manager._preferred_device(spec) == "cuda"
+
+
+def test_mlx_device_family_does_not_share_cpu_capacity(app) -> None:
+    manager = ModelManager(app.state.settings)
+
+    assert manager._device_family("mlx") == "mlx"
+    assert manager._device_family("mlx:0") == "mlx"
+
+
+def test_build_runtime_dispatches_qwen_workers_by_backend(
+    app,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    class FakeProxy:
+        def __init__(self, *, spec, settings, device, worker_path, worker_label):
+            calls.append(
+                {
+                    "backend": spec.backend,
+                    "device": device,
+                    "worker_path": Path(worker_path).name,
+                    "worker_label": worker_label,
+                }
+            )
+
+    monkeypatch.setattr(backends_module, "QwenWorkerProxy", FakeProxy)
+    settings = app.state.settings
+    cuda_spec = replace(settings.model_settings["qwen3-asr-0.6b"], backend="qwen-worker")
+    mlx_spec = replace(settings.model_settings["qwen3-asr-0.6b"], backend="qwen-mlx-worker")
+
+    backends_module.build_runtime(spec=cuda_spec, settings=settings, device="cuda")
+    backends_module.build_runtime(spec=mlx_spec, settings=settings, device="mlx")
+
+    assert calls == [
+        {
+            "backend": "qwen-worker",
+            "device": "cuda",
+            "worker_path": "qwen_worker.py",
+            "worker_label": "qwen-worker",
+        },
+        {
+            "backend": "qwen-mlx-worker",
+            "device": "mlx",
+            "worker_path": "qwen_mlx_worker.py",
+            "worker_label": "qwen-mlx-worker",
+        },
+    ]
 
 
 def test_gpu_scheduler_evicts_idle_model_to_make_room(

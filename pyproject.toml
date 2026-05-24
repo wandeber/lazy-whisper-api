@@ -29,6 +29,7 @@ dependencies = [
 [project.optional-dependencies]
 cpu = ["torch==2.11.0+cpu"]
 gpu-cu126 = ["torch==2.11.0+cu126"]
+macos = ["torch==2.12.0"]
 dev = ["pytest==8.4.2"]
 
 [tool.setuptools.packages.find]

@@ -3,7 +3,7 @@ VENV ?= .venv
 PIP := $(VENV)/bin/pip
 PY := $(VENV)/bin/python
 
-.PHONY: venv install install-gpu install-cpu install-qwen-runtime test run start stop restart status logs
+.PHONY: venv install install-gpu install-cpu install-macos install-qwen-runtime install-qwen-cuda-runtime install-qwen-mlx-runtime test run start stop restart status logs
 
 venv:
 	$(PYTHON) -m venv $(VENV)
@@ -14,11 +14,20 @@ install: venv
 install-cpu: venv
 	$(PIP) install --extra-index-url https://download.pytorch.org/whl/cpu -e '.[cpu]'
 
+install-macos: venv
+	$(PIP) install -e '.[macos]'
+
 install-gpu: venv
 	$(PIP) install --extra-index-url https://download.pytorch.org/whl/cu126 -e '.[gpu-cu126]'
 
 install-qwen-runtime:
 	./setup-qwen-runtime.sh
+
+install-qwen-cuda-runtime:
+	./setup-qwen-runtime.sh
+
+install-qwen-mlx-runtime:
+	./setup-qwen-mlx-runtime.sh
 
 test:
 	$(PY) -m pytest
