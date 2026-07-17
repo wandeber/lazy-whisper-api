@@ -14,14 +14,20 @@ The main process owns:
 - SSE orchestration
 - realtime WebSocket state
 - model scheduling and capacity decisions
+- optional speaker-diarization scheduling
 
 Relevant files:
 
-- [lazy_whisper_api/app.py](/home/wandeber/codex-playground/lazy_whisper_api/app.py)
-- [lazy_whisper_api/config.py](/home/wandeber/codex-playground/lazy_whisper_api/config.py)
-- [lazy_whisper_api/model_manager.py](/home/wandeber/codex-playground/lazy_whisper_api/model_manager.py)
-- [lazy_whisper_api/streaming.py](/home/wandeber/codex-playground/lazy_whisper_api/streaming.py)
-- [lazy_whisper_api/realtime.py](/home/wandeber/codex-playground/lazy_whisper_api/realtime.py)
+- [lazy_whisper_api/app.py](../lazy_whisper_api/app.py)
+- [lazy_whisper_api/config.py](../lazy_whisper_api/config.py)
+- [lazy_whisper_api/diarization.py](../lazy_whisper_api/diarization.py)
+- [lazy_whisper_api/model_manager.py](../lazy_whisper_api/model_manager.py)
+- [lazy_whisper_api/streaming.py](../lazy_whisper_api/streaming.py)
+- [lazy_whisper_api/realtime.py](../lazy_whisper_api/realtime.py)
+
+FastAPI's lifespan owns both runtime managers. Graceful application shutdown
+unloads diarization and ASR workers deterministically instead of relying on
+interpreter-level exit callbacks.
 
 ### Whisper backend
 
@@ -29,7 +35,7 @@ Whisper-family models live directly in the main process through `faster-whisper`
 
 Relevant file:
 
-- [lazy_whisper_api/backends.py](/home/wandeber/codex-playground/lazy_whisper_api/backends.py)
+- [lazy_whisper_api/backends.py](../lazy_whisper_api/backends.py)
 
 ### Qwen backends
 
@@ -37,17 +43,62 @@ Qwen-family models live in a separate Python runtime with a separate dependency 
 
 Relevant files:
 
-- [lazy_whisper_api/backends.py](/home/wandeber/codex-playground/lazy_whisper_api/backends.py)
-- [lazy_whisper_api/qwen_worker.py](/home/wandeber/codex-playground/lazy_whisper_api/qwen_worker.py)
-- [lazy_whisper_api/qwen_mlx_worker.py](/home/wandeber/codex-playground/lazy_whisper_api/qwen_mlx_worker.py)
-- [setup-qwen-runtime.sh](/home/wandeber/codex-playground/setup-qwen-runtime.sh)
-- [setup-qwen-mlx-runtime.sh](/home/wandeber/codex-playground/setup-qwen-mlx-runtime.sh)
-- [requirements-qwen-cu126.txt](/home/wandeber/codex-playground/requirements-qwen-cu126.txt)
-- [requirements-qwen-mlx.txt](/home/wandeber/codex-playground/requirements-qwen-mlx.txt)
+- [lazy_whisper_api/backends.py](../lazy_whisper_api/backends.py)
+- [lazy_whisper_api/qwen_worker.py](../lazy_whisper_api/qwen_worker.py)
+- [lazy_whisper_api/qwen_mlx_worker.py](../lazy_whisper_api/qwen_mlx_worker.py)
+- [setup-qwen-runtime.sh](../setup-qwen-runtime.sh)
+- [setup-qwen-mlx-runtime.sh](../setup-qwen-mlx-runtime.sh)
+- [requirements-qwen-cu126.txt](../requirements-qwen-cu126.txt)
+- [requirements-qwen-mlx.txt](../requirements-qwen-mlx.txt)
 
 The main API talks to each Qwen worker over line-delimited JSON-RPC on `stdin/stdout`.
 `qwen-worker` runs the existing PyTorch/CUDA `qwen-asr` runtime. `qwen-mlx-worker`
 runs `mlx-qwen3-asr` on Apple Silicon. Both expose the same public model aliases.
+
+### Diarization backend
+
+Speaker diarization lives in a separate pyannote runtime so heavy diarization
+dependencies do not affect the main ASR environment.
+
+Relevant files:
+
+- [lazy_whisper_api/diarization.py](../lazy_whisper_api/diarization.py)
+- [lazy_whisper_api/diarization_types.py](../lazy_whisper_api/diarization_types.py)
+- [lazy_whisper_api/speaker_attribution.py](../lazy_whisper_api/speaker_attribution.py)
+- [lazy_whisper_api/diarization_worker.py](../lazy_whisper_api/diarization_worker.py)
+- [setup-diarization-runtime.sh](../setup-diarization-runtime.sh)
+- [smoke-test-diarization.sh](../smoke-test-diarization.sh)
+- [requirements-diarization.txt](../requirements-diarization.txt)
+
+The worker uses `pyannote/speaker-diarization-community-1` by default. That
+model is gated on Hugging Face, so first use requires accepted model conditions
+and either `ASR_DIARIZATION_SETUP_HF_TOKEN` in the private `.env` file or an
+exported `HF_TOKEN` during setup. The complete pipeline is downloaded to
+`ASR_DIARIZATION_MODEL_PATH`; runtime launchers remove the setup-only variable
+before starting the API, and request-time workers load only that local path.
+They run with Hugging Face and Transformers offline modes enabled, telemetry
+disabled, an isolated HOME, and an allowlisted environment without credentials.
+
+On macOS, `torchcodec` also requires shared FFmpeg libraries. The repository's
+static ffmpeg wrapper is enough for command-line conversion but not dynamic
+library loading, so setup validates `torchcodec` explicitly and points Homebrew
+users to `brew install ffmpeg` when those libraries are missing.
+
+The high-risk native stack (`torch`, `torchaudio`, `torchcodec`, NumPy, and the
+Hugging Face client) is pinned alongside pyannote. Setup also runs `pip check`
+before accepting the environment, so dependency conflicts fail during setup
+rather than on the first request.
+
+### Shared worker transport
+
+Qwen and pyannote domain proxies both use
+[lazy_whisper_api/worker_protocol.py](../lazy_whisper_api/worker_protocol.py).
+Worker stdout is consumed by a background reader and handed to startup/RPC
+waiters through a queue. The shared transport owns protocol validation, stderr
+draining, optional timeouts, signal isolation, graceful shutdown, and forced
+process cleanup.
+Domain-specific proxies only build arguments and normalize results; diarization
+also supplies its credential-redaction function and strict offline environment.
 
 ## Model abstraction
 
@@ -63,7 +114,7 @@ Each configured model has:
 - `gpu_memory_reservation_mb`
 - `max_concurrent_requests`
 
-That configuration is produced in [lazy_whisper_api/config.py](/home/wandeber/codex-playground/lazy_whisper_api/config.py) from `ASR_*` variables, with `WHISPER_*` preserved as legacy aliases.
+That configuration is produced in [lazy_whisper_api/config.py](../lazy_whisper_api/config.py) from `ASR_*` variables, with `WHISPER_*` preserved as legacy aliases.
 Worker Python paths can be configured by family with `ASR_FAMILY_RUNTIME_PYTHON_MAP`
 or by canonical model with `ASR_MODEL_RUNTIME_PYTHON_MAP`.
 
@@ -72,12 +123,23 @@ or by canonical model with `ASR_MODEL_RUNTIME_PYTHON_MAP`.
 ### Batch HTTP
 
 1. The client calls `POST /v1/audio/transcriptions` or `POST /v1/audio/translations`.
-2. The upload is streamed to a temp file in chunks.
-3. Request parameters are validated and model aliases are resolved.
-4. [ModelManager](/home/wandeber/codex-playground/lazy_whisper_api/model_manager.py) acquires a lease.
-5. The selected backend transcribes in a worker thread, not on the event loop.
-6. If timestamps were requested and the backend did not return them directly, alignment runs as a second step.
-7. The response is rendered as `json`, `text`, `srt`, `vtt`, or `verbose_json`.
+2. Request parameters are validated and model aliases are resolved.
+3. A diarized request reserves the single diarization slot before upload or ASR
+   work. Saturated requests therefore fail immediately with `429`.
+4. The upload is streamed to a temp file in chunks.
+5. [ModelManager](../lazy_whisper_api/model_manager.py) acquires an ASR lease.
+6. The selected backend transcribes in a worker thread, not on the event loop.
+7. If timestamps were requested and the backend did not return them directly,
+   alignment runs as a second step. Diarized Whisper requests always enable word
+   timestamps so speaker changes are not reduced to coarse ASR segment boundaries.
+8. If `diarize=true`, pyannote runs after transcription/alignment.
+9. A temporal turn index adds speaker labels to timestamped segments and words
+   without rescanning and sorting the complete diarization timeline per word.
+10. The response is rendered as `json`, `text`, `srt`, `vtt`, or `verbose_json`.
+
+Diarization is intentionally limited to non-streaming transcription requests
+with `response_format=verbose_json`, so speaker labels are always visible to the
+client that paid the extra runtime cost.
 
 ### SSE streaming
 
@@ -134,6 +196,17 @@ Supported server events:
 - Apple Silicon models use the `mlx` device family
 - MLX models do not share the CPU loaded-model limit
 - concurrency is still enforced per model
+
+### Diarization
+
+- diarization runs outside the ASR model scheduler
+- default device is CPU for predictable Apple Silicon behavior
+- only one diarization job runs at a time
+- the diarization slot is reserved before ASR starts, so saturation fails fast
+- the diarization worker unloads after its configured idle window
+- the health payload distinguishes disabled, missing-runtime, missing-model,
+  ready, loaded, busy, and error states without loading the model
+- request-time diarization has no network or credential dependency
 
 Eviction rule:
 

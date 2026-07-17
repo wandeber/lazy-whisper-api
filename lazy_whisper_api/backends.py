@@ -4,13 +4,8 @@ from __future__ import annotations
 
 import base64
 import gc
-import json
-import logging
 import os
-import subprocess
 import tempfile
-import threading
-import uuid
 import wave
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator
@@ -22,9 +17,9 @@ import torch
 from faster_whisper import WhisperModel
 
 from .config import ModelSettings, Settings
+from .worker_protocol import JsonLineWorkerClient
 
 
-LOGGER = logging.getLogger("whisper_api")
 QWEN_CUDA_WORKER_PATH = Path(__file__).resolve().parent / "qwen_worker.py"
 QWEN_MLX_WORKER_PATH = Path(__file__).resolve().parent / "qwen_mlx_worker.py"
 # Keep the old constant as a compatibility affordance for any local imports or
@@ -75,6 +70,7 @@ class WordTiming:
     end: float
     word: str
     probability: float | None = None
+    speaker: str | None = None
 
 
 @dataclass(frozen=True)
@@ -92,6 +88,7 @@ class SegmentTiming:
     compression_ratio: float = 0.0
     no_speech_prob: float = 0.0
     words: list[WordTiming] = field(default_factory=list)
+    speaker: str | None = None
 
 
 @dataclass(frozen=True)
@@ -406,8 +403,6 @@ class QwenWorkerProxy(RuntimeHandle):
         worker_label: str = "qwen-worker",
     ) -> None:
         super().__init__(spec=spec, settings=settings, device=device)
-        self._io_lock = threading.RLock()
-        self._stderr_thread: threading.Thread | None = None
         self.worker_path = worker_path
         self.worker_label = worker_label
         python_path = spec.runtime_python
@@ -448,81 +443,14 @@ class QwenWorkerProxy(RuntimeHandle):
             "--aligner-dtype",
             spec.aligner_dtype or "float32",
         ]
-        self.process = subprocess.Popen(
-            args,
-            cwd=str(settings.project_root),
+        self._client = JsonLineWorkerClient(
+            args=args,
+            cwd=settings.project_root,
             env=env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
+            label=f"{worker_label}:{spec.name}",
         )
-        self._start_stderr_drain()
-        ready = self._read_startup_message()
-        self.worker_pid = int(ready.get("pid", self.process.pid or 0)) or self.process.pid
-
-    def _start_stderr_drain(self) -> None:
-        if self.process.stderr is None:
-            return
-
-        def drain() -> None:
-            assert self.process.stderr is not None
-            for line in self.process.stderr:
-                LOGGER.info("[%s:%s] %s", self.worker_label, self.spec.name, line.rstrip())
-
-        self._stderr_thread = threading.Thread(
-            target=drain,
-            daemon=True,
-            name=f"{self.worker_label}-stderr-{self.spec.name}",
-        )
-        self._stderr_thread.start()
-
-    def _read_startup_message(self) -> dict[str, Any]:
-        if self.process.stdout is None:
-            raise RuntimeError(f"Worker for '{self.spec.name}' has no stdout pipe.")
-        line = self.process.stdout.readline()
-        if not line:
-            raise RuntimeError(
-                f"Worker for '{self.spec.name}' exited before signalling readiness."
-            )
-        payload = json.loads(line)
-        if payload.get("type") != "ready":
-            raise RuntimeError(
-                payload.get("error", {}).get("message")
-                or f"Worker for '{self.spec.name}' failed to initialize."
-            )
-        return payload
-
-    def _request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        if self.process.poll() is not None:
-            raise RuntimeError(
-                f"Worker for '{self.spec.name}' is not running (exit={self.process.returncode})."
-            )
-        if self.process.stdin is None or self.process.stdout is None:
-            raise RuntimeError(f"Worker for '{self.spec.name}' has broken pipes.")
-
-        request_id = uuid.uuid4().hex
-        payload = {"id": request_id, "method": method, "params": params}
-        encoded = json.dumps(payload, ensure_ascii=False) + "\n"
-
-        with self._io_lock:
-            self.process.stdin.write(encoded)
-            self.process.stdin.flush()
-            line = self.process.stdout.readline()
-
-        if not line:
-            raise RuntimeError(f"Worker for '{self.spec.name}' closed the connection.")
-
-        response = json.loads(line)
-        if response.get("id") != request_id:
-            raise RuntimeError(
-                f"Worker for '{self.spec.name}' returned a mismatched response id."
-            )
-        if not response.get("ok", False):
-            error = response.get("error", {})
-            raise RuntimeError(error.get("message", f"Worker error in {method}."))
-        return response["result"]
+        self.process = self._client.process
+        self.worker_pid = self._client.worker_pid
 
     def _normalize_transcription(self, result: dict[str, Any]) -> BackendTranscription:
         raw_language = str(result.get("language", ""))
@@ -584,7 +512,7 @@ class QwenWorkerProxy(RuntimeHandle):
             raise RuntimeError(
                 f"Model '{self.spec.name}' only supports task='transcribe' in the Qwen backend."
             )
-        result = self._request(
+        result = self._client.request(
             "transcribe_file",
             {
                 "audio_path": str(audio_path),
@@ -610,7 +538,7 @@ class QwenWorkerProxy(RuntimeHandle):
             raise RuntimeError(
                 f"Model '{self.spec.name}' only supports task='transcribe' in the Qwen backend."
             )
-        result = self._request(
+        result = self._client.request(
             "transcribe_pcm",
             {
                 "pcm_base64": base64.b64encode(pcm_bytes).decode("ascii"),
@@ -629,7 +557,7 @@ class QwenWorkerProxy(RuntimeHandle):
         text: str,
         language: str,
     ) -> list[SegmentTiming]:
-        result = self._request(
+        result = self._client.request(
             "align_file",
             {
                 "audio_path": str(audio_path),
@@ -647,19 +575,7 @@ class QwenWorkerProxy(RuntimeHandle):
         ).segments
 
     def close(self) -> None:
-        with self._io_lock:
-            try:
-                self._request("shutdown", {})
-            except Exception:
-                pass
-
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
+        self._client.close()
 
 
 def build_runtime(

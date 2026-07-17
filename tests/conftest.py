@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -19,6 +20,13 @@ TEST_API_KEY = "test-key"
 def app(monkeypatch: pytest.MonkeyPatch, tmp_path) -> Iterator:
     model_dir = tmp_path / "models" / "distil-multi4-ct2"
     model_dir.mkdir(parents=True)
+    diarization_model_dir = tmp_path / "models" / "pyannote-community-1"
+    diarization_model_dir.mkdir(parents=True)
+    (diarization_model_dir / "config.yaml").write_text("pipeline: fake\n", encoding="utf-8")
+    (diarization_model_dir / ".lazy-whisper-offline-ready").write_text(
+        '{"format_version": 1, "model_id": "pyannote/speaker-diarization-community-1", "revision": "test"}\n',
+        encoding="utf-8",
+    )
 
     env = {
         "ASR_API_HOST": "127.0.0.1",
@@ -88,6 +96,16 @@ def app(monkeypatch: pytest.MonkeyPatch, tmp_path) -> Iterator:
         ),
         "ASR_MODEL_ALIGNER_DEVICE_MAP": "qwen3-asr-0.6b=cpu,qwen3-asr-1.7b=cpu",
         "ASR_MODEL_ALIGNER_DTYPE_MAP": "qwen3-asr-0.6b=float32,qwen3-asr-1.7b=float32",
+        "ASR_DIARIZATION_ENABLED": "false",
+        "ASR_DIARIZATION_BACKEND": "pyannote",
+        "ASR_DIARIZATION_MODEL_ID": "pyannote/speaker-diarization-community-1",
+        "ASR_DIARIZATION_MODEL_PATH": str(diarization_model_dir),
+        "ASR_DIARIZATION_DEVICE": "cpu",
+        "ASR_DIARIZATION_IDLE_SECONDS": "1800",
+        "ASR_DIARIZATION_RUNTIME_PYTHON": sys.executable,
+        "ASR_DIARIZATION_STARTUP_TIMEOUT_SECONDS": "300",
+        "ASR_DIARIZATION_REQUEST_TIMEOUT_SECONDS": "3600",
+        "PYANNOTE_METRICS_ENABLED": "0",
         "ASR_GPU_MEMORY_BUDGET_MB": "8192",
         "ASR_MAX_LOADED_MODELS_CPU": "1",
         "ASR_MAX_CONCURRENT_REQUESTS_PER_MODEL": "2",

@@ -7,6 +7,7 @@ from typing import Any
 
 from fastapi.responses import JSONResponse, PlainTextResponse
 
+from .speaker_attribution import build_speaker_transcript_segments
 from .transcription import TranscriptionResult
 
 
@@ -69,40 +70,73 @@ def build_verbose_json(result: TranscriptionResult) -> dict[str, Any]:
 
     words: list[dict[str, Any]] = []
     for segment in result.segments:
-        payload["segments"].append(
-            {
-                "id": segment.id,
-                "seek": segment.seek,
-                "start": segment.start,
-                "end": segment.end,
-                "text": segment.text.strip(),
-                "tokens": segment.tokens,
-                "temperature": segment.temperature,
-                "avg_logprob": segment.avg_logprob,
-                "compression_ratio": segment.compression_ratio,
-                "no_speech_prob": segment.no_speech_prob,
-                "words": [
-                    {
-                        "start": word.start,
-                        "end": word.end,
-                        "word": word.word,
-                        "probability": word.probability,
-                    }
-                    for word in (segment.words or [])
-                ],
-            }
-        )
+        segment_words = []
         for word in segment.words or []:
-            words.append(
-                {
-                    "start": word.start,
-                    "end": word.end,
-                    "word": word.word,
-                    "probability": word.probability,
-                }
-            )
+            word_payload: dict[str, Any] = {
+                "start": word.start,
+                "end": word.end,
+                "word": word.word,
+                "probability": word.probability,
+            }
+            if getattr(word, "speaker", None) is not None:
+                word_payload["speaker"] = word.speaker
+            segment_words.append(word_payload)
+
+        segment_payload = {
+            "id": segment.id,
+            "seek": segment.seek,
+            "start": segment.start,
+            "end": segment.end,
+            "text": segment.text.strip(),
+            "tokens": segment.tokens,
+            "temperature": segment.temperature,
+            "avg_logprob": segment.avg_logprob,
+            "compression_ratio": segment.compression_ratio,
+            "no_speech_prob": segment.no_speech_prob,
+            "words": segment_words,
+        }
+        if getattr(segment, "speaker", None) is not None:
+            segment_payload["speaker"] = segment.speaker
+        payload["segments"].append(segment_payload)
+        for word in segment.words or []:
+            word_payload = {
+                "start": word.start,
+                "end": word.end,
+                "word": word.word,
+                "probability": word.probability,
+            }
+            if getattr(word, "speaker", None) is not None:
+                word_payload["speaker"] = word.speaker
+            words.append(word_payload)
     if words:
         payload["words"] = words
+    if result.diarization is not None:
+        speakers = sorted({turn.speaker for turn in result.diarization.turns})
+        speaker_segments = build_speaker_transcript_segments(segments=result.segments)
+        payload["diarization"] = {
+            "model": result.diarization.model,
+            "device": result.diarization.device,
+            "num_speakers": len(speakers),
+            "speakers": speakers,
+            "processing_seconds": result.diarization.processing_seconds,
+            "segments": [
+                {
+                    "start": turn.start,
+                    "end": turn.end,
+                    "speaker": turn.speaker,
+                }
+                for turn in result.diarization.turns
+            ],
+            "speaker_segments": [
+                {
+                    "start": segment.start,
+                    "end": segment.end,
+                    "speaker": segment.speaker,
+                    "text": segment.text,
+                }
+                for segment in speaker_segments
+            ],
+        }
     return payload
 
 

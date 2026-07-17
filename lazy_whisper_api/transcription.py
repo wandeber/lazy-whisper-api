@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,8 +14,11 @@ from starlette.concurrency import run_in_threadpool
 
 from .backends import BackendTranscription, SegmentTiming, segments_to_text, write_pcm16_wav
 from .config import Settings
+from .diarization import DiarizationManager, validate_diarization_request
+from .diarization_types import DiarizationResult
 from .errors import api_error
 from .model_manager import LoadedModel, ModelManager
+from .speaker_attribution import enrich_segments_with_speakers
 
 
 SUPPORTED_RESPONSE_FORMATS = {"json", "text", "srt", "verbose_json", "vtt"}
@@ -33,6 +37,10 @@ class TranscriptionRequest:
     response_format: str
     temperature: float
     timestamp_granularities: list[str] | None
+    diarize: bool
+    num_speakers: int | None
+    min_speakers: int | None
+    max_speakers: int | None
 
 
 @dataclass(frozen=True)
@@ -45,6 +53,7 @@ class TranscriptionResult:
     text: str
     info: Any
     segments: list[Any]
+    diarization: DiarizationResult | None = None
 
 
 def normalize_timestamp_granularities(values: list[str] | None) -> set[str]:
@@ -59,6 +68,16 @@ def requires_timestamps(*, response_format: str, granularity_set: set[str]) -> b
 
 def validate_request(settings: Settings, payload: TranscriptionRequest) -> str:
     """Validate public request parameters and resolve model aliases."""
+    if not payload.diarize and any(
+        value is not None
+        for value in (payload.num_speakers, payload.min_speakers, payload.max_speakers)
+    ):
+        raise api_error(
+            400,
+            "Speaker-count options require diarize=true.",
+            error_type="invalid_request_error",
+        )
+
     try:
         canonical_model = settings.resolve_model_name(payload.model)
     except KeyError as exc:
@@ -94,16 +113,26 @@ def validate_request(settings: Settings, payload: TranscriptionRequest) -> str:
             "Unsupported timestamp_granularities value.",
             error_type="invalid_request_error",
         )
+    if payload.diarize:
+        validate_diarization_request(
+            settings=settings,
+            response_format=payload.response_format,
+            task=payload.task,
+            num_speakers=payload.num_speakers,
+            min_speakers=payload.min_speakers,
+            max_speakers=payload.max_speakers,
+        )
     if granularity_set and not spec.supports("timestamps"):
         raise api_error(
             400,
             f"Model '{payload.model}' does not support timestamps.",
             error_type="invalid_request_error",
         )
-    if requires_timestamps(
+    needs_timestamped_response = payload.diarize or requires_timestamps(
         response_format=payload.response_format,
         granularity_set=granularity_set,
-    ) and not spec.supports("timestamps"):
+    )
+    if needs_timestamped_response and not spec.supports("timestamps"):
         raise api_error(
             400,
             f"Model '{payload.model}' does not support timestamped responses.",
@@ -275,59 +304,79 @@ async def transcribe_upload(
     *,
     settings: Settings,
     model_manager: ModelManager,
+    diarization_manager: DiarizationManager,
     payload: TranscriptionRequest,
 ) -> TranscriptionResult:
     """Persist the upload temporarily, run one backend, and clean up."""
     canonical_model = validate_request(settings, payload)
-
-    suffix = Path(payload.file.filename or "upload.bin").suffix
-    from tempfile import NamedTemporaryFile
-
-    with NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp_path = Path(tmp.name)
+    reservation = diarization_manager.reserve() if payload.diarize else nullcontext()
+    tmp_path: Path | None = None
 
     try:
-        await write_upload_to_tempfile(
-            upload=payload.file,
-            destination=tmp_path,
-            chunk_size=settings.upload_chunk_size,
-        )
+        with reservation:
+            suffix = Path(payload.file.filename or "upload.bin").suffix
+            with NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp_path = Path(tmp.name)
 
-        granularity_set = normalize_timestamp_granularities(payload.timestamp_granularities)
-        wants_timestamps = requires_timestamps(
-            response_format=payload.response_format,
-            granularity_set=granularity_set,
-        )
-        with model_manager.lease(canonical_model) as lease:
-            if lease.runtime is None:
-                raise RuntimeError(f"Model '{canonical_model}' is not loaded.")
-            transcription = await run_in_threadpool(
-                transcribe_sync,
-                runtime=lease.runtime,
-                audio_path=tmp_path,
-                language=payload.language or None,
-                task=payload.task,
-                prompt=payload.prompt or None,
-                temperature=payload.temperature,
-                word_timestamps=("word" in granularity_set) and lease.spec.family == "whisper",
+            await write_upload_to_tempfile(
+                upload=payload.file,
+                destination=tmp_path,
+                chunk_size=settings.upload_chunk_size,
             )
-            segments = transcription.segments
-            if wants_timestamps:
-                segments = await run_in_threadpool(
-                    ensure_timestamp_segments,
-                    lease=lease,
+
+            granularity_set = normalize_timestamp_granularities(payload.timestamp_granularities)
+            wants_timestamps = payload.diarize or requires_timestamps(
+                response_format=payload.response_format,
+                granularity_set=granularity_set,
+            )
+            with model_manager.lease(canonical_model) as lease:
+                if lease.runtime is None:
+                    raise RuntimeError(f"Model '{canonical_model}' is not loaded.")
+                transcription = await run_in_threadpool(
+                    transcribe_sync,
+                    runtime=lease.runtime,
                     audio_path=tmp_path,
-                    transcription=transcription,
+                    language=payload.language or None,
+                    task=payload.task,
+                    prompt=payload.prompt or None,
+                    temperature=payload.temperature,
+                    # Diarization needs the smallest practical ASR intervals. A single
+                    # Whisper segment often spans a speaker change, while word timings
+                    # let the reconciliation step preserve that change accurately.
+                    word_timestamps=(payload.diarize or "word" in granularity_set)
+                    and lease.spec.family == "whisper",
                 )
-            text = transcription.text or segments_to_text(segments)
-            device = lease.actual_device
+                segments = transcription.segments
+                if wants_timestamps:
+                    segments = await run_in_threadpool(
+                        ensure_timestamp_segments,
+                        lease=lease,
+                        audio_path=tmp_path,
+                        transcription=transcription,
+                    )
+                text = transcription.text or segments_to_text(segments)
+                device = lease.actual_device
+            diarization: DiarizationResult | None = None
+            if payload.diarize:
+                diarization = await run_in_threadpool(
+                    diarization_manager.diarize_reserved,
+                    audio_path=tmp_path,
+                    num_speakers=payload.num_speakers,
+                    min_speakers=payload.min_speakers,
+                    max_speakers=payload.max_speakers,
+                )
+                segments = enrich_segments_with_speakers(
+                    segments=segments,
+                    turns=diarization.turns,
+                )
     except HTTPException:
         raise
     except Exception as exc:
         raise api_error(500, str(exc), error_type="server_error") from exc
     finally:
         await payload.file.close()
-        tmp_path.unlink(missing_ok=True)
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
 
     return TranscriptionResult(
         model_name=canonical_model,
@@ -336,4 +385,5 @@ async def transcribe_upload(
         text=text,
         info=transcription.info,
         segments=segments,
+        diarization=diarization,
     )

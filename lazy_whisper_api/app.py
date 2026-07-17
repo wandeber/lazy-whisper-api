@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-import atexit
+from contextlib import asynccontextmanager
 from typing import Any
 
 import torch
 from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, UploadFile, WebSocket
+from starlette.concurrency import run_in_threadpool
 
 from .auth import build_api_key_dependency
 from .config import configure_logging, load_settings
+from .diarization import DiarizationManager
 from .errors import http_exception_handler
 from .model_manager import ModelManager
 from .realtime import RealtimeTranscriptionServer
@@ -24,12 +26,27 @@ def create_app() -> FastAPI:
     configure_logging(settings.log_level)
 
     model_manager = ModelManager(settings)
-    atexit.register(model_manager.unload_all)
+    diarization_manager = DiarizationManager(settings)
 
-    app = FastAPI(title="Local ASR API", version="3.0.0")
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        """Tie every loaded model and worker to this FastAPI instance."""
+        try:
+            yield
+        finally:
+            # Worker shutdown can wait briefly for a subprocess. Keep those waits
+            # off the event loop, and always unload ASR even if diarization cleanup
+            # encounters an unexpected process-level failure.
+            try:
+                await run_in_threadpool(diarization_manager.unload)
+            finally:
+                await run_in_threadpool(model_manager.unload_all)
+
+    app = FastAPI(title="Local ASR API", version="3.0.0", lifespan=lifespan)
     app.add_exception_handler(HTTPException, http_exception_handler)
     app.state.settings = settings
     app.state.model_manager = model_manager
+    app.state.diarization_manager = diarization_manager
 
     require_api_key = build_api_key_dependency(settings.api_key)
     v1_router = APIRouter(prefix="/v1", dependencies=[Depends(require_api_key)])
@@ -41,6 +58,7 @@ def create_app() -> FastAPI:
             "default_model": settings.default_model,
             "cuda_available": torch.cuda.is_available(),
             "loaded_models": model_manager.snapshot(),
+            "diarization": diarization_manager.snapshot(),
         }
 
     @v1_router.get("/models")
@@ -74,6 +92,10 @@ def create_app() -> FastAPI:
         stream: bool,
         temperature: float,
         timestamp_granularities: list[str] | None,
+        diarize: bool,
+        num_speakers: int | None,
+        min_speakers: int | None,
+        max_speakers: int | None,
     ):
         payload = TranscriptionRequest(
             file=file,
@@ -84,8 +106,20 @@ def create_app() -> FastAPI:
             response_format=response_format,
             temperature=temperature,
             timestamp_granularities=timestamp_granularities,
+            diarize=diarize,
+            num_speakers=num_speakers,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
         )
         if stream:
+            if diarize:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "message": "Diarization is not supported for streaming responses.",
+                        "type": "invalid_request_error",
+                    },
+                )
             if task != "transcribe":
                 raise HTTPException(
                     status_code=400,
@@ -102,6 +136,7 @@ def create_app() -> FastAPI:
         result = await transcribe_upload(
             settings=settings,
             model_manager=model_manager,
+            diarization_manager=diarization_manager,
             payload=payload,
         )
         return build_transcription_response(result)
@@ -119,6 +154,10 @@ def create_app() -> FastAPI:
             default=None,
             alias="timestamp_granularities[]",
         ),
+        diarize: bool = Form(default=False),
+        num_speakers: int | None = Form(default=None),
+        min_speakers: int | None = Form(default=None),
+        max_speakers: int | None = Form(default=None),
     ):
         return await handle_audio_request(
             file=file,
@@ -130,6 +169,10 @@ def create_app() -> FastAPI:
             stream=stream,
             temperature=temperature,
             timestamp_granularities=timestamp_granularities,
+            diarize=diarize,
+            num_speakers=num_speakers,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
         )
 
     @v1_router.post("/audio/translations", response_model=None)
@@ -144,6 +187,10 @@ def create_app() -> FastAPI:
             default=None,
             alias="timestamp_granularities[]",
         ),
+        diarize: bool = Form(default=False),
+        num_speakers: int | None = Form(default=None),
+        min_speakers: int | None = Form(default=None),
+        max_speakers: int | None = Form(default=None),
     ):
         return await handle_audio_request(
             file=file,
@@ -155,6 +202,10 @@ def create_app() -> FastAPI:
             stream=stream,
             temperature=temperature,
             timestamp_granularities=timestamp_granularities,
+            diarize=diarize,
+            num_speakers=num_speakers,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
         )
 
     @app.websocket("/v1/realtime")

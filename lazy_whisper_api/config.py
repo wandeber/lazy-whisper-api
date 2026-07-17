@@ -111,6 +111,21 @@ class ModelSettings:
 
 
 @dataclass(frozen=True)
+class DiarizationSettings:
+    """Static config for the optional local speaker diarization backend."""
+
+    enabled: bool
+    backend: str
+    model_id: str
+    model_path: str
+    device: str
+    idle_seconds: int
+    runtime_python: str
+    startup_timeout_seconds: int
+    request_timeout_seconds: int
+
+
+@dataclass(frozen=True)
 class Settings:
     """Full runtime settings for the API process."""
 
@@ -129,6 +144,7 @@ class Settings:
     model_alias_map: dict[str, str]
     model_settings: dict[str, ModelSettings]
     supported_model_ids: tuple[str, ...]
+    diarization: DiarizationSettings
 
     def resolve_model_name(self, requested_model: str) -> str:
         canonical = self.model_alias_map.get(requested_model, requested_model)
@@ -162,6 +178,34 @@ def load_settings() -> Settings:
     )
     gpu_memory_budget_mb = int(
         getenv_alias("ASR_GPU_MEMORY_BUDGET_MB", "WHISPER_GPU_MEMORY_BUDGET_MB", "8192") or "8192"
+    )
+    diarization_enabled = parse_bool(os.environ.get("ASR_DIARIZATION_ENABLED"), default=False)
+    diarization_backend = os.environ.get("ASR_DIARIZATION_BACKEND", "pyannote").strip()
+    diarization_model_id = os.environ.get(
+        "ASR_DIARIZATION_MODEL_ID",
+        "pyannote/speaker-diarization-community-1",
+    ).strip() or "pyannote/speaker-diarization-community-1"
+    diarization_model_path = normalize_pathish(
+        os.environ.get(
+            "ASR_DIARIZATION_MODEL_PATH",
+            str(PROJECT_ROOT / "models" / "pyannote-speaker-diarization-community-1"),
+        ),
+        PROJECT_ROOT,
+    )
+    diarization_device = os.environ.get("ASR_DIARIZATION_DEVICE", "cpu").strip() or "cpu"
+    diarization_idle_seconds = int(os.environ.get("ASR_DIARIZATION_IDLE_SECONDS", "1800") or "1800")
+    diarization_runtime_python = normalize_pathish(
+        os.environ.get(
+            "ASR_DIARIZATION_RUNTIME_PYTHON",
+            str(PROJECT_ROOT / ".venv-diarization" / "bin" / "python"),
+        ),
+        PROJECT_ROOT,
+    )
+    diarization_startup_timeout_seconds = int(
+        os.environ.get("ASR_DIARIZATION_STARTUP_TIMEOUT_SECONDS", "300") or "300"
+    )
+    diarization_request_timeout_seconds = int(
+        os.environ.get("ASR_DIARIZATION_REQUEST_TIMEOUT_SECONDS", "3600") or "3600"
     )
 
     model_alias_map = parse_mapping(
@@ -350,6 +394,14 @@ def load_settings() -> Settings:
         raise ValueError("ASR_UPLOAD_CHUNK_SIZE must be >= 1")
     if gpu_memory_budget_mb < 1:
         raise ValueError("ASR_GPU_MEMORY_BUDGET_MB must be >= 1")
+    if diarization_backend != "pyannote":
+        raise ValueError("ASR_DIARIZATION_BACKEND currently supports only 'pyannote'")
+    if diarization_idle_seconds < 0:
+        raise ValueError("ASR_DIARIZATION_IDLE_SECONDS must be >= 0")
+    if diarization_startup_timeout_seconds < 1:
+        raise ValueError("ASR_DIARIZATION_STARTUP_TIMEOUT_SECONDS must be >= 1")
+    if diarization_request_timeout_seconds < 1:
+        raise ValueError("ASR_DIARIZATION_REQUEST_TIMEOUT_SECONDS must be >= 1")
 
     model_settings = {
         model_name: ModelSettings(
@@ -409,4 +461,15 @@ def load_settings() -> Settings:
         model_alias_map=model_alias_map,
         model_settings=model_settings,
         supported_model_ids=supported_model_ids,
+        diarization=DiarizationSettings(
+            enabled=diarization_enabled,
+            backend=diarization_backend,
+            model_id=diarization_model_id,
+            model_path=diarization_model_path,
+            device=diarization_device,
+            idle_seconds=diarization_idle_seconds,
+            runtime_python=diarization_runtime_python,
+            startup_timeout_seconds=diarization_startup_timeout_seconds,
+            request_timeout_seconds=diarization_request_timeout_seconds,
+        ),
     )

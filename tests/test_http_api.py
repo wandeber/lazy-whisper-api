@@ -7,6 +7,9 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 import lazy_whisper_api.streaming as streaming_module
+from fastapi.testclient import TestClient
+from lazy_whisper_api.backends import SegmentTiming, WordTiming
+from lazy_whisper_api.diarization_types import DiarizationResult, DiarizationTurn
 from lazy_whisper_api.model_manager import LoadedModel
 from lazy_whisper_api.transcription import TranscriptionResult
 
@@ -40,6 +43,29 @@ def test_healthz_requires_api_key(client) -> None:
     assert response.json()["error"]["type"] == "invalid_api_key"
 
 
+def test_healthz_reports_diarization_installation_state(client, auth_headers) -> None:
+    response = client.get("/healthz", headers=auth_headers)
+
+    assert response.status_code == 200
+    diarization = response.json()["diarization"]
+    assert diarization["state"] == "disabled"
+    assert diarization["runtime_available"] is True
+    assert diarization["model_available"] is True
+    assert diarization["ready"] is False
+    assert diarization["offline"] is True
+
+
+def test_app_lifespan_unloads_all_runtime_managers(app, monkeypatch) -> None:
+    unloaded = []
+    monkeypatch.setattr(app.state.diarization_manager, "unload", lambda: unloaded.append("diarization"))
+    monkeypatch.setattr(app.state.model_manager, "unload_all", lambda: unloaded.append("models"))
+
+    with TestClient(app):
+        pass
+
+    assert unloaded == ["diarization", "models"]
+
+
 def test_models_endpoint_includes_qwen_aliases(client, auth_headers) -> None:
     response = client.get("/v1/models", headers=auth_headers)
 
@@ -56,7 +82,7 @@ def test_transcription_without_stream_returns_json(
     sample_upload,
     monkeypatch,
 ) -> None:
-    async def fake_transcribe_upload(*, settings, model_manager, payload):
+    async def fake_transcribe_upload(*, settings, model_manager, diarization_manager, payload):
         assert settings.default_model == "turbo"
         assert payload.model == "whisper-1"
         return TranscriptionResult(
@@ -79,6 +105,120 @@ def test_transcription_without_stream_returns_json(
 
     assert response.status_code == 200
     assert response.json() == {"text": "hola desde test", "model": "turbo"}
+
+
+def test_transcription_diarize_verbose_json_returns_speaker_payload(
+    client,
+    auth_headers,
+    sample_upload,
+    monkeypatch,
+) -> None:
+    async def fake_transcribe_upload(*, settings, model_manager, diarization_manager, payload):
+        assert payload.diarize is True
+        assert payload.num_speakers == 2
+        return TranscriptionResult(
+            model_name="turbo",
+            device="cpu",
+            response_format="verbose_json",
+            text="hola mundo",
+            info=SimpleNamespace(language="es", duration=1.0, language_probability=1.0),
+            segments=[
+                SegmentTiming(
+                    id=0,
+                    start=0.0,
+                    end=1.0,
+                    text="hola mundo",
+                    speaker="SPEAKER_00",
+                    words=[
+                        WordTiming(
+                            start=0.0,
+                            end=0.4,
+                            word="hola",
+                            probability=0.9,
+                            speaker="SPEAKER_00",
+                        ),
+                        WordTiming(
+                            start=0.6,
+                            end=1.0,
+                            word="mundo",
+                            probability=0.9,
+                            speaker="SPEAKER_01",
+                        ),
+                    ],
+                )
+            ],
+            diarization=DiarizationResult(
+                model="pyannote/speaker-diarization-community-1",
+                device="cpu",
+                turns=[
+                    DiarizationTurn(start=0.0, end=0.5, speaker="SPEAKER_00"),
+                    DiarizationTurn(start=0.5, end=1.0, speaker="SPEAKER_01"),
+                ],
+            ),
+        )
+
+    monkeypatch.setattr(app_module, "transcribe_upload", fake_transcribe_upload)
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        headers=auth_headers,
+        files=sample_upload,
+        data={
+            "model": "whisper-1",
+            "response_format": "verbose_json",
+            "diarize": "true",
+            "num_speakers": "2",
+        },
+    )
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["segments"][0]["speaker"] == "SPEAKER_00"
+    assert payload["segments"][0]["words"][1]["speaker"] == "SPEAKER_01"
+    assert payload["words"][0]["speaker"] == "SPEAKER_00"
+    assert payload["diarization"]["num_speakers"] == 2
+    assert payload["diarization"]["speakers"] == ["SPEAKER_00", "SPEAKER_01"]
+    assert payload["diarization"]["segments"][1] == {
+        "start": 0.5,
+        "end": 1.0,
+        "speaker": "SPEAKER_01",
+    }
+    assert payload["diarization"]["speaker_segments"] == [
+        {
+            "start": 0.0,
+            "end": 0.4,
+            "speaker": "SPEAKER_00",
+            "text": "hola",
+        },
+        {
+            "start": 0.6,
+            "end": 1.0,
+            "speaker": "SPEAKER_01",
+            "text": "mundo",
+        },
+    ]
+
+
+def test_speaker_count_options_require_diarization(
+    client,
+    auth_headers,
+    sample_upload,
+) -> None:
+    response = client.post(
+        "/v1/audio/transcriptions",
+        headers=auth_headers,
+        files=sample_upload,
+        data={
+            "model": "whisper-1",
+            "response_format": "verbose_json",
+            "num_speakers": "2",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == (
+        "Speaker-count options require diarize=true."
+    )
 
 
 def test_transcription_stream_true_emits_sse_events(
@@ -132,6 +272,29 @@ def test_transcription_stream_true_emits_sse_events(
     assert events[2][1]["device"] == "cuda"
 
 
+def test_transcription_stream_true_with_diarization_is_rejected(
+    client,
+    auth_headers,
+    sample_upload,
+) -> None:
+    response = client.post(
+        "/v1/audio/transcriptions",
+        headers=auth_headers,
+        files=sample_upload,
+        data={
+            "model": "whisper-1",
+            "stream": "true",
+            "diarize": "true",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == {
+        "message": "Diarization is not supported for streaming responses.",
+        "type": "invalid_request_error",
+    }
+
+
 def test_translation_stream_true_is_rejected(
     client,
     auth_headers,
@@ -168,6 +331,29 @@ def test_qwen_translation_is_rejected(
     assert response.status_code == 400
     assert response.json()["error"]["type"] == "invalid_request_error"
     assert "does not support translation" in response.json()["error"]["message"]
+
+
+def test_translation_with_diarization_is_rejected(
+    client,
+    auth_headers,
+    sample_upload,
+) -> None:
+    response = client.post(
+        "/v1/audio/translations",
+        headers=auth_headers,
+        files=sample_upload,
+        data={
+            "model": "whisper-1",
+            "response_format": "verbose_json",
+            "diarize": "true",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == {
+        "message": "Diarization is only supported for /v1/audio/transcriptions.",
+        "type": "invalid_request_error",
+    }
 
 
 def test_transcription_stream_true_uses_synthetic_qwen_path(

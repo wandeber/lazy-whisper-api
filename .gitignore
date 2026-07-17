@@ -2,6 +2,7 @@
 .venv/
 .venv-qwen/
 .venv-qwen-mlx/
+.venv-diarization/
 .cache/
 models/
 __pycache__/

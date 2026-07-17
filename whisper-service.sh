@@ -6,7 +6,7 @@ SERVICE_NAME="whisper-api.service"
 SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 UNIT_PATH="$SYSTEMD_USER_DIR/$SERVICE_NAME"
 ENV_FILE="$SCRIPT_DIR/.env"
-STATUS_HOST="127.0.0.1"
+STATUS_HOST="localhost"
 STATUS_PORT="43556"
 
 require_systemd() {
@@ -29,12 +29,16 @@ load_env_file() {
   # shellcheck disable=SC1091
   source "$ENV_FILE"
   set +a
+  unset \
+    ASR_DIARIZATION_SETUP_HF_TOKEN \
+    HUGGING_FACE_HUB_TOKEN \
+    HUGGINGFACE_HUB_TOKEN
 
-  STATUS_HOST="${ASR_API_HOST:-${WHISPER_API_HOST:-127.0.0.1}}"
+  STATUS_HOST="${ASR_API_HOST:-${WHISPER_API_HOST:-localhost}}"
   STATUS_PORT="${ASR_API_PORT:-${WHISPER_API_PORT:-43556}}"
 
   if [[ "$STATUS_HOST" == "0.0.0.0" ]]; then
-    STATUS_HOST="127.0.0.1"
+    STATUS_HOST="localhost"
   fi
 }
 
@@ -58,6 +62,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory={script_dir}
 EnvironmentFile=-{env_file}
+UnsetEnvironment=ASR_DIARIZATION_SETUP_HF_TOKEN HUGGING_FACE_HUB_TOKEN HUGGINGFACE_HUB_TOKEN
 ExecStart={script_dir}/whisper-api.sh
 Restart=always
 RestartSec=5

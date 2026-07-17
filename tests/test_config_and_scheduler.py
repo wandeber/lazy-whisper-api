@@ -27,6 +27,32 @@ def test_settings_resolve_qwen_alias_and_capabilities(app) -> None:
     assert spec.runtime_python.endswith(".venv-qwen/bin/python")
 
 
+def test_settings_load_diarization_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ASR_DIARIZATION_ENABLED", "true")
+    monkeypatch.setenv("ASR_DIARIZATION_MODEL_ID", "pyannote/custom")
+    monkeypatch.setenv("ASR_DIARIZATION_MODEL_PATH", "./models/pyannote-custom")
+    monkeypatch.setenv("ASR_DIARIZATION_DEVICE", "cpu")
+    monkeypatch.setenv("ASR_DIARIZATION_IDLE_SECONDS", "120")
+    monkeypatch.setenv("ASR_DIARIZATION_STARTUP_TIMEOUT_SECONDS", "45")
+    monkeypatch.setenv("ASR_DIARIZATION_REQUEST_TIMEOUT_SECONDS", "900")
+    monkeypatch.setenv(
+        "ASR_DIARIZATION_RUNTIME_PYTHON",
+        "./.venv-diarization/bin/python",
+    )
+
+    settings = load_settings()
+
+    assert settings.diarization.enabled is True
+    assert settings.diarization.backend == "pyannote"
+    assert settings.diarization.model_id == "pyannote/custom"
+    assert settings.diarization.model_path.endswith("models/pyannote-custom")
+    assert settings.diarization.device == "cpu"
+    assert settings.diarization.idle_seconds == 120
+    assert settings.diarization.runtime_python.endswith(".venv-diarization/bin/python")
+    assert settings.diarization.startup_timeout_seconds == 45
+    assert settings.diarization.request_timeout_seconds == 900
+
+
 def test_model_runtime_python_map_allows_apple_silicon_qwen_backend(
     app,
     monkeypatch: pytest.MonkeyPatch,

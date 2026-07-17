@@ -1,0 +1,9 @@
+# Keep the native and model-loading stack reproducible. pyannote's dependency
+# ranges intentionally have no upper bounds, so leaving these packages floating
+# can change a previously validated local installation without a repository edit.
+pyannote.audio==4.0.7
+huggingface-hub==1.23.0
+numpy==2.5.1
+torch==2.13.0
+torchaudio==2.11.0
+torchcodec==0.14.0
