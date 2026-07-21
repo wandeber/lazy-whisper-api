@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import wave
 from types import SimpleNamespace
 
 from lazy_whisper_api.qwen_mlx_worker import Worker
@@ -114,3 +115,47 @@ def test_mlx_worker_align_file_groups_word_timings_into_segments(monkeypatch) ->
     ]
     assert fake_session.calls[0]["return_timestamps"] is True
     assert fake_session.calls[0]["forced_aligner"] == "Qwen/Qwen3-ForcedAligner-0.6B"
+
+
+def test_mlx_worker_exact_word_alignment_does_not_rerun_asr(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    worker, fake_session = make_worker(monkeypatch)
+    wav_path = tmp_path / "canonical.wav"
+    with wave.open(str(wav_path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16_000)
+        handle.writeframes(b"\x00\x00" * 16_000)
+
+    class FakeAligner:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def align(self, audio, text, language):
+            self.calls.append((audio, text, language))
+            return [
+                SimpleNamespace(text="hola", start_time=0.2, end_time=0.6),
+                SimpleNamespace(text="mundo", start_time=0.65, end_time=0.95),
+            ]
+
+    aligner = FakeAligner()
+    monkeypatch.setattr(worker, "_load_aligner", lambda: aligner)
+
+    result = worker.align_words_file(
+        audio_path=str(wav_path),
+        text="hola mundo",
+        language="Spanish",
+    )
+
+    assert fake_session.calls == []
+    assert len(aligner.calls[0][0]) == 16_000
+    assert aligner.calls[0][1:] == ("hola mundo", "Spanish")
+    assert result == {
+        "duration": 1.0,
+        "words": [
+            {"start": 0.2, "end": 0.6, "word": "hola", "probability": None},
+            {"start": 0.65, "end": 0.95, "word": "mundo", "probability": None},
+        ],
+    }

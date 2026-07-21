@@ -42,9 +42,11 @@ def app(monkeypatch: pytest.MonkeyPatch, tmp_path) -> Iterator:
             "distil-multi4=distil-multi4,"
             "qwen-0.6b=qwen3-asr-0.6b,"
             "qwen-1.7b=qwen3-asr-1.7b,"
+            "qwen-1.7b-edit-max=qwen3-asr-1.7b,"
             "qwen3-asr-0.6b=qwen3-asr-0.6b,"
             "qwen3-asr-1.7b=qwen3-asr-1.7b"
         ),
+        "ASR_MODEL_PROFILE_MAP": "qwen-1.7b-edit-max=edit-max-v1",
         "ASR_MODEL_SOURCE_MAP": (
             f"turbo=turbo,"
             f"large-v3=large-v3,"

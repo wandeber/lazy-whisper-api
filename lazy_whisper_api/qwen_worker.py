@@ -74,10 +74,9 @@ def pcm16_to_float32(pcm_bytes: bytes) -> np.ndarray:
     return pcm.astype(np.float32) / 32768.0
 
 
-def align_items_to_segments(text: str, items: list[Any]) -> list[dict[str, Any]]:
-    if not items:
-        return []
-    words = [
+def align_items_to_words(items: list[Any]) -> list[dict[str, Any]]:
+    """Normalize exact aligner items without applying subtitle heuristics."""
+    return [
         asdict(
             WordPayload(
                 start=float(item.start_time),
@@ -87,7 +86,6 @@ def align_items_to_segments(text: str, items: list[Any]) -> list[dict[str, Any]]
         )
         for item in items
     ]
-    return words_to_timestamp_segments(words)
 
 
 def word_text(word: dict[str, Any]) -> str:
@@ -285,16 +283,46 @@ class Worker:
         text: str,
         language: str,
     ) -> dict[str, Any]:
-        aligner = self._load_aligner()
-        result = aligner.align(
+        words = self._align_words(
             audio=audio_path,
             text=text,
             language=language,
-        )[0]
-        segments = align_items_to_segments(text, list(result.items))
+        )
         return {
             "duration": audio_duration_seconds(audio_path),
-            "segments": segments,
+            "segments": words_to_timestamp_segments(words),
+        }
+
+    def _align_words(
+        self,
+        *,
+        audio: Any,
+        text: str,
+        language: str,
+    ) -> list[dict[str, Any]]:
+        """Run the one cached forced aligner and return its native word view."""
+        aligner = self._load_aligner()
+        result = aligner.align(
+            audio=audio,
+            text=text,
+            language=language,
+        )[0]
+        return align_items_to_words(list(result.items))
+
+    def align_words_file(
+        self,
+        *,
+        audio_path: str,
+        text: str,
+        language: str,
+    ) -> dict[str, Any]:
+        return {
+            "duration": audio_duration_seconds(audio_path),
+            "words": self._align_words(
+                audio=audio_path,
+                text=text,
+                language=language,
+            ),
         }
 
 
@@ -337,6 +365,7 @@ def main() -> int:
         "transcribe_file": worker.transcribe_file,
         "transcribe_pcm": worker.transcribe_pcm,
         "align_file": worker.align_file,
+        "align_words_file": worker.align_words_file,
     }
 
     for line in sys.stdin:

@@ -207,7 +207,8 @@ async def create_transcription_stream_response(
     payload: TranscriptionRequest,
 ) -> StreamingResponse:
     """Create an SSE response for a completed uploaded audio file."""
-    canonical_model = validate_request(settings, payload)
+    route = validate_request(settings, payload, surface="sse")
+    canonical_model = route.canonical_model
     spec = settings.model_settings[canonical_model]
     if not spec.supports("stream"):
         raise api_error(

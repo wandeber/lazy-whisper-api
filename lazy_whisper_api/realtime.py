@@ -342,11 +342,16 @@ class RealtimeTranscriptionServer:
                 )
             if "model" in transcription:
                 try:
-                    updated.model = self.settings.resolve_model_name(str(transcription["model"]))
+                    route = self.settings.resolve_model_route(str(transcription["model"]))
                 except KeyError as exc:
                     raise ValueError(
                         f"Unsupported model '{transcription['model']}'."
                     ) from exc
+                if route.profile.is_edit_max:
+                    raise ValueError(
+                        f"Model '{transcription['model']}' does not support realtime transcription."
+                    )
+                updated.model = route.canonical_model
                 if not self.settings.model_settings[updated.model].supports("realtime"):
                     raise ValueError(
                         f"Model '{transcription['model']}' does not support realtime transcription."

@@ -9,6 +9,7 @@ from fastapi import HTTPException
 
 import lazy_whisper_api.backends as backends_module
 import lazy_whisper_api.model_manager as model_manager_module
+from lazy_whisper_api.backends import QwenWorkerProxy
 from lazy_whisper_api.config import load_settings
 from lazy_whisper_api.model_manager import ModelManager
 
@@ -25,6 +26,102 @@ def test_settings_resolve_qwen_alias_and_capabilities(app) -> None:
     assert spec.supports("stream")
     assert spec.supports("realtime")
     assert spec.runtime_python.endswith(".venv-qwen/bin/python")
+
+
+def test_settings_resolve_edit_profile_without_new_canonical_model(app) -> None:
+    settings = app.state.settings
+
+    route = settings.resolve_model_route("qwen-1.7b-edit-max")
+
+    assert route.requested_model == "qwen-1.7b-edit-max"
+    assert route.canonical_model == "qwen3-asr-1.7b"
+    assert route.profile.name == "edit-max-v1"
+    assert route.profile.is_edit_max is True
+    assert "qwen-1.7b-edit-max" not in settings.model_settings
+    assert settings.resolve_model_name("qwen-1.7b-edit-max") == "qwen3-asr-1.7b"
+
+
+def test_subtitle_and_edit_routes_share_one_loaded_qwen_runtime(
+    app,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = app.state.settings
+    manager = ModelManager(settings)
+    builds = []
+
+    def fake_build_runtime(*, spec, settings, device):
+        builds.append(spec.name)
+        return SimpleNamespace(
+            close=lambda: None,
+            worker_pid=123,
+            supports_native_streaming=False,
+            preferred_stream_sample_rate_hz=16_000,
+        )
+
+    monkeypatch.setattr(model_manager_module, "build_runtime", fake_build_runtime)
+    normal = settings.resolve_model_route("qwen-1.7b")
+    editing = settings.resolve_model_route("qwen-1.7b-edit-max")
+
+    with manager.lease(normal.canonical_model):
+        pass
+    with manager.lease(editing.canonical_model):
+        pass
+
+    assert builds == ["qwen3-asr-1.7b"]
+    assert [entry["id"] for entry in manager.snapshot()] == ["qwen3-asr-1.7b"]
+
+
+def test_old_explicit_alias_map_can_omit_edit_profile(
+    app,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "ASR_MODEL_ALIAS_MAP",
+        "whisper-1=turbo,turbo=turbo,qwen-1.7b=qwen3-asr-1.7b",
+    )
+    monkeypatch.delenv("ASR_MODEL_PROFILE_MAP", raising=False)
+
+    settings = load_settings()
+
+    assert "qwen-1.7b-edit-max" not in settings.supported_model_ids
+    with pytest.raises(KeyError):
+        settings.resolve_model_route("qwen-1.7b-edit-max")
+
+
+def test_reserved_edit_id_requires_exact_profile_binding(
+    app,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ASR_MODEL_PROFILE_MAP", raising=False)
+
+    with pytest.raises(ValueError, match="Reserved model ID 'qwen-1.7b-edit-max'"):
+        load_settings()
+
+
+def test_reserved_edit_id_cannot_redirect_to_another_model(
+    app,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    aliases = app.state.settings.model_alias_map.copy()
+    aliases["qwen-1.7b-edit-max"] = "qwen3-asr-0.6b"
+    monkeypatch.setenv(
+        "ASR_MODEL_ALIAS_MAP",
+        ",".join(f"{key}={value}" for key, value in aliases.items()),
+    )
+
+    with pytest.raises(ValueError, match="Reserved model ID 'qwen-1.7b-edit-max'"):
+        load_settings()
+
+
+def test_invalid_edit_threshold_fails_at_startup(
+    app,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ASR_EDIT_MAX_VAD_START_THRESHOLD", "0.2")
+    monkeypatch.setenv("ASR_EDIT_MAX_VAD_END_THRESHOLD", "0.3")
+
+    with pytest.raises(ValueError, match="ASR_EDIT_MAX_VAD_START_THRESHOLD"):
+        load_settings()
 
 
 def test_settings_load_diarization_config(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -170,6 +267,42 @@ def test_build_runtime_dispatches_qwen_workers_by_backend(
             "worker_label": "qwen-mlx-worker",
         },
     ]
+
+
+def test_qwen_proxy_normalizes_exact_word_alignment() -> None:
+    proxy = object.__new__(QwenWorkerProxy)
+    proxy._client = SimpleNamespace(
+        request=lambda method, params: {
+            "words": [
+                {"start": 0.1, "end": 0.4, "word": "hola", "probability": None},
+                {"start": 0.5, "end": 0.9, "word": "mundo", "probability": 0.8},
+            ]
+        }
+    )
+
+    words = proxy.align_words_file(
+        audio_path=Path("/tmp/audio.wav"),
+        text="hola mundo",
+        language="es",
+    )
+
+    assert [(word.start, word.end, word.word) for word in words] == [
+        (0.1, 0.4, "hola"),
+        (0.5, 0.9, "mundo"),
+    ]
+    assert words[1].probability == 0.8
+
+
+def test_qwen_proxy_rejects_empty_alignment_for_nonempty_text() -> None:
+    proxy = object.__new__(QwenWorkerProxy)
+    proxy._client = SimpleNamespace(request=lambda method, params: {"words": []})
+
+    with pytest.raises(RuntimeError, match="returned no words"):
+        proxy.align_words_file(
+            audio_path=Path("/tmp/audio.wav"),
+            text="hola",
+            language="es",
+        )
 
 
 def test_gpu_scheduler_evicts_idle_model_to_make_room(

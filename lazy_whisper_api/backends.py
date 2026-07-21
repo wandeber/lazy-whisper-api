@@ -173,6 +173,19 @@ class RuntimeHandle(ABC):
             f"Backend '{self.spec.backend}' for model '{self.spec.name}' does not support alignment."
         )
 
+    def align_words_file(
+        self,
+        *,
+        audio_path: Path,
+        text: str,
+        language: str,
+    ) -> list[WordTiming]:
+        """Return ungrouped exact-text word alignment when supported."""
+        raise NotImplementedError(
+            f"Backend '{self.spec.backend}' for model '{self.spec.name}' does not support "
+            "exact word alignment."
+        )
+
     @abstractmethod
     def close(self) -> None:
         """Release backend resources."""
@@ -573,6 +586,45 @@ class QwenWorkerProxy(RuntimeHandle):
                 "segments": result.get("segments", []),
             }
         ).segments
+
+    def align_words_file(
+        self,
+        *,
+        audio_path: Path,
+        text: str,
+        language: str,
+    ) -> list[WordTiming]:
+        """Ask the Qwen aligner for raw words without subtitle regrouping."""
+        normalized_text = text.strip()
+        if not normalized_text:
+            return []
+        result = self._client.request(
+            "align_words_file",
+            {
+                "audio_path": str(audio_path),
+                "text": normalized_text,
+                "language": normalize_qwen_language(language) or language,
+            },
+        )
+        words = [
+            WordTiming(
+                start=float(word.get("start", 0.0)),
+                end=float(word.get("end", 0.0)),
+                word=str(word.get("word", "")),
+                probability=(
+                    None
+                    if word.get("probability") is None
+                    else float(word.get("probability"))
+                ),
+            )
+            for word in result.get("words", [])
+            if str(word.get("word", "")).strip()
+        ]
+        if not words:
+            raise RuntimeError(
+                "Edit-max forced alignment returned no words for a non-empty transcript."
+            )
+        return words
 
     def close(self) -> None:
         self._client.close()

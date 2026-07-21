@@ -7,9 +7,17 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 import lazy_whisper_api.streaming as streaming_module
+import lazy_whisper_api.transcription as transcription_module
 from fastapi.testclient import TestClient
-from lazy_whisper_api.backends import SegmentTiming, WordTiming
+from lazy_whisper_api.audio_timeline import DecodedPcm16Timeline
+from lazy_whisper_api.backends import (
+    BackendTranscription,
+    SegmentTiming,
+    TranscriptionInfo,
+    WordTiming,
+)
 from lazy_whisper_api.diarization_types import DiarizationResult, DiarizationTurn
+from lazy_whisper_api.editing_types import AcousticSpeechSpan, VadAnalysis
 from lazy_whisper_api.model_manager import LoadedModel
 from lazy_whisper_api.transcription import TranscriptionResult
 
@@ -70,10 +78,229 @@ def test_models_endpoint_includes_qwen_aliases(client, auth_headers) -> None:
     response = client.get("/v1/models", headers=auth_headers)
 
     assert response.status_code == 200
-    model_ids = {item["id"] for item in response.json()["data"]}
+    models = {item["id"]: item for item in response.json()["data"]}
+    model_ids = set(models)
     assert "whisper-1" in model_ids
     assert "qwen3-asr-0.6b" in model_ids
     assert "qwen-0.6b" in model_ids
+    assert models["qwen-1.7b-edit-max"]["profile"] == "edit-max-v1"
+    assert models["qwen-1.7b-edit-max"]["canonical_model"] == "qwen3-asr-1.7b"
+    assert "profile" not in models["qwen-1.7b"]
+
+
+def test_edit_max_rejects_incompatible_format_before_model_lease(
+    app,
+    client,
+    auth_headers,
+    sample_upload,
+    monkeypatch,
+) -> None:
+    def reject_lease(_model_name: str):
+        raise AssertionError("Validation must fail before a model lease.")
+
+    monkeypatch.setattr(app.state.model_manager, "lease", reject_lease)
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        headers=auth_headers,
+        files=sample_upload,
+        data={"model": "qwen-1.7b-edit-max", "response_format": "json"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == (
+        "Model 'qwen-1.7b-edit-max' requires response_format='verbose_json'."
+    )
+
+
+def test_edit_max_rejects_streaming_before_model_lease(
+    app,
+    client,
+    auth_headers,
+    sample_upload,
+    monkeypatch,
+) -> None:
+    def reject_lease(_model_name: str):
+        raise AssertionError("Validation must fail before a model lease.")
+
+    monkeypatch.setattr(app.state.model_manager, "lease", reject_lease)
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        headers=auth_headers,
+        files=sample_upload,
+        data={
+            "model": "qwen-1.7b-edit-max",
+            "response_format": "verbose_json",
+            "stream": "true",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "non-streaming batch transcription" in response.json()["error"]["message"]
+
+
+def test_edit_max_returns_words_and_sample_native_editing_metadata(
+    app,
+    client,
+    auth_headers,
+    sample_upload,
+    monkeypatch,
+) -> None:
+    timeline = DecodedPcm16Timeline(pcm_bytes=b"\x00\x00" * 16_000, sample_rate_hz=16_000)
+    monkeypatch.setattr(
+        transcription_module,
+        "decode_audio_timeline",
+        lambda **_kwargs: timeline,
+    )
+    monkeypatch.setattr(
+        transcription_module,
+        "analyze_speech",
+        lambda **_kwargs: VadAnalysis(
+            sample_rate_hz=16_000,
+            sample_count=16_000,
+            frames=tuple(),
+            spans=(
+                AcousticSpeechSpan(
+                    start_sample=2_880,
+                    end_sample=13_120,
+                    peak_probability=0.96,
+                    mean_probability=0.90,
+                    start_energy_confirmed=True,
+                    end_energy_confirmed=True,
+                ),
+            ),
+        ),
+    )
+
+    class FakeEditRuntime:
+        worker_pid = 123
+
+        def transcribe_file(self, **_kwargs):
+            return BackendTranscription(
+                text="hola mundo",
+                info=TranscriptionInfo(language="es", duration=1.0),
+                segments=[],
+            )
+
+        def align_words_file(self, **_kwargs):
+            return [
+                WordTiming(start=0.2, end=0.4, word="hola"),
+                WordTiming(start=0.5, end=0.8, word="mundo"),
+            ]
+
+    leased_names = []
+
+    @contextmanager
+    def fake_lease(model_name: str):
+        leased_names.append(model_name)
+        spec = app.state.settings.model_settings[model_name]
+        yield LoadedModel(
+            spec=spec,
+            runtime=FakeEditRuntime(),
+            actual_device="mlx",
+            actual_compute_type=spec.compute_type,
+            loaded_at=time.time(),
+            last_used=time.time(),
+        )
+
+    monkeypatch.setattr(app.state.model_manager, "lease", fake_lease)
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        headers=auth_headers,
+        files=sample_upload,
+        data={
+            "model": "qwen-1.7b-edit-max",
+            "response_format": "verbose_json",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert leased_names == ["qwen3-asr-1.7b"]
+    assert payload["model"] == "qwen3-asr-1.7b"
+    assert [word["word"] for word in payload["words"]] == ["hola", "mundo"]
+    assert payload["words"][0]["start"] == 0.18
+    assert payload["words"][1]["end"] == 0.82
+    assert payload["editing"]["requested_model"] == "qwen-1.7b-edit-max"
+    assert payload["editing"]["profile"] == "edit-max-v1"
+    assert payload["editing"]["timeline"] == {
+        "sample_rate_hz": 16_000,
+        "sample_count": 16_000,
+        "duration": 1.0,
+        "time_origin": "decoded_audio_start",
+    }
+    assert payload["editing"]["speech_regions"][0]["evidence"] == (
+        "alignment_acoustic"
+    )
+    assert payload["editing"]["edit_boundaries"][0]["sample"] == 2_880
+
+
+def test_edit_max_fails_closed_when_nonempty_text_has_no_aligned_words(
+    app,
+    client,
+    auth_headers,
+    sample_upload,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        transcription_module,
+        "decode_audio_timeline",
+        lambda **_kwargs: DecodedPcm16Timeline(
+            pcm_bytes=b"\x00\x00" * 16_000,
+            sample_rate_hz=16_000,
+        ),
+    )
+    vad_called = []
+    monkeypatch.setattr(
+        transcription_module,
+        "analyze_speech",
+        lambda **_kwargs: vad_called.append(True),
+    )
+
+    class EmptyAlignmentRuntime:
+        worker_pid = 123
+
+        def transcribe_file(self, **_kwargs):
+            return BackendTranscription(
+                text="hola",
+                info=TranscriptionInfo(language="es", duration=1.0),
+                segments=[],
+            )
+
+        def align_words_file(self, **_kwargs):
+            return []
+
+    @contextmanager
+    def fake_lease(model_name: str):
+        spec = app.state.settings.model_settings[model_name]
+        yield LoadedModel(
+            spec=spec,
+            runtime=EmptyAlignmentRuntime(),
+            actual_device="mlx",
+            actual_compute_type=spec.compute_type,
+            loaded_at=time.time(),
+            last_used=time.time(),
+        )
+
+    monkeypatch.setattr(app.state.model_manager, "lease", fake_lease)
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        headers=auth_headers,
+        files=sample_upload,
+        data={
+            "model": "qwen-1.7b-edit-max",
+            "response_format": "verbose_json",
+        },
+    )
+
+    assert response.status_code == 500
+    assert response.json()["error"]["message"] == (
+        "Edit-max forced alignment returned no words for a non-empty transcript."
+    )
+    assert vad_called == []
 
 
 def test_transcription_without_stream_returns_json(

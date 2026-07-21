@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +8,8 @@ version = "0.1.0"
 description = "OpenAI-compatible local transcription API with lazy-loaded Faster Whisper models."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 authors = [
   { name = "wandeber" },
 ]
@@ -19,6 +20,7 @@ dependencies = [
   "virtualenv==21.2.1",
   "python-multipart==0.0.25",
   "av==17.0.0",
+  "numpy==2.4.6",
   "faster-whisper==1.2.1",
   "imageio-ffmpeg==0.6.0",
   "huggingface_hub==1.10.1",

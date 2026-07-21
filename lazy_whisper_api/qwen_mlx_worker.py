@@ -19,6 +19,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 
 PCM16_SAMPLE_WIDTH_BYTES = 2
 PCM16_CHANNELS = 1
@@ -50,6 +52,19 @@ def write_pcm16_wav(
         handle.setsampwidth(PCM16_SAMPLE_WIDTH_BYTES)
         handle.setframerate(sample_rate_hz)
         handle.writeframes(pcm_bytes)
+
+
+def load_canonical_wav(audio_path: str) -> tuple[np.ndarray, float]:
+    """Load the main process's canonical mono/16 kHz/PCM16 WAV exactly once."""
+    with wave.open(audio_path, "rb") as handle:
+        if handle.getnchannels() != 1 or handle.getsampwidth() != PCM16_SAMPLE_WIDTH_BYTES:
+            raise ValueError("Edit-max alignment requires mono PCM16 WAV audio.")
+        if handle.getframerate() != 16_000:
+            raise ValueError("Edit-max alignment requires a 16 kHz WAV timeline.")
+        frame_count = handle.getnframes()
+        pcm_bytes = handle.readframes(frame_count)
+    audio = np.frombuffer(pcm_bytes, dtype="<i2").astype(np.float32) / 32768.0
+    return audio, frame_count / 16_000.0
 
 
 def mlx_dtype_from_name(name: str) -> Any:
@@ -105,6 +120,21 @@ def normalize_word_items(items: list[Any]) -> list[dict[str, Any]]:
             )
         )
     return words
+
+
+def normalize_aligned_words(items: list[Any]) -> list[dict[str, Any]]:
+    """Normalize direct ForcedAligner output, whose fields use *_time names."""
+    return [
+        asdict(
+            WordPayload(
+                start=float(value_from(item, "start_time", 0.0) or 0.0),
+                end=float(value_from(item, "end_time", 0.0) or 0.0),
+                word=str(value_from(item, "text", "")),
+            )
+        )
+        for item in items
+        if str(value_from(item, "text", "")).strip()
+    ]
 
 
 def chunks_to_segments(chunks: list[Any]) -> list[dict[str, Any]]:
@@ -214,13 +244,16 @@ class Worker:
         device: str,
         dtype_name: str,
         aligner_source: str | None,
+        aligner_dtype_name: str = "float16",
     ) -> None:
         self.model_name = model_name
         self.model_source = model_source
         self.device = device
         self.dtype_name = dtype_name
         self.aligner_source = aligner_source or None
+        self.aligner_dtype_name = aligner_dtype_name or "float16"
         self.session = self._load_session()
+        self.aligner: Any | None = None
 
     def _load_session(self) -> Any:
         from mlx_qwen3_asr import Session
@@ -233,6 +266,27 @@ class Worker:
             model=self.model_source,
             dtype=mlx_dtype_from_name(self.dtype_name),
         )
+
+    def _load_aligner(self) -> Any:
+        """Lazily load one direct MLX aligner for edit-max requests only."""
+        if self.aligner is not None:
+            return self.aligner
+        if not self.aligner_source:
+            raise RuntimeError(
+                f"Model '{self.model_name}' was asked for exact words but no "
+                "aligner was configured."
+            )
+        from mlx_qwen3_asr import ForcedAligner
+
+        log(
+            f"Loading mlx-qwen3-asr aligner source={self.aligner_source} "
+            f"dtype={self.aligner_dtype_name}"
+        )
+        self.aligner = ForcedAligner(
+            model_path=self.aligner_source,
+            dtype=mlx_dtype_from_name(self.aligner_dtype_name),
+        )
+        return self.aligner
 
     def _transcribe(
         self,
@@ -330,6 +384,21 @@ class Worker:
             "segments": segments,
         }
 
+    def align_words_file(
+        self,
+        *,
+        audio_path: str,
+        text: str,
+        language: str,
+    ) -> dict[str, Any]:
+        """Align exact ASR text without invoking Session.transcribe again."""
+        audio, duration = load_canonical_wav(audio_path)
+        items = self._load_aligner().align(audio, text, language)
+        return {
+            "duration": duration,
+            "words": normalize_aligned_words(list(items)),
+        }
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="mlx-qwen3-asr sidecar worker")
@@ -352,6 +421,7 @@ def main() -> int:
             device=args.device,
             dtype_name=args.dtype,
             aligner_source=args.aligner_source or None,
+            aligner_dtype_name=args.aligner_dtype or "float16",
         )
     except Exception as exc:
         encode_json(
@@ -368,6 +438,7 @@ def main() -> int:
         "transcribe_file": worker.transcribe_file,
         "transcribe_pcm": worker.transcribe_pcm,
         "align_file": worker.align_file,
+        "align_words_file": worker.align_words_file,
     }
 
     for line in sys.stdin:

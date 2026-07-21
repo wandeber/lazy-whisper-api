@@ -19,9 +19,13 @@ The main process owns:
 Relevant files:
 
 - [lazy_whisper_api/app.py](../lazy_whisper_api/app.py)
+- [lazy_whisper_api/audio_timeline.py](../lazy_whisper_api/audio_timeline.py)
 - [lazy_whisper_api/config.py](../lazy_whisper_api/config.py)
 - [lazy_whisper_api/diarization.py](../lazy_whisper_api/diarization.py)
+- [lazy_whisper_api/editing.py](../lazy_whisper_api/editing.py)
+- [lazy_whisper_api/editing_types.py](../lazy_whisper_api/editing_types.py)
 - [lazy_whisper_api/model_manager.py](../lazy_whisper_api/model_manager.py)
+- [lazy_whisper_api/silero_vad.py](../lazy_whisper_api/silero_vad.py)
 - [lazy_whisper_api/streaming.py](../lazy_whisper_api/streaming.py)
 - [lazy_whisper_api/realtime.py](../lazy_whisper_api/realtime.py)
 
@@ -118,6 +122,21 @@ That configuration is produced in [lazy_whisper_api/config.py](../lazy_whisper_a
 Worker Python paths can be configured by family with `ASR_FAMILY_RUNTIME_PYTHON_MAP`
 or by canonical model with `ASR_MODEL_RUNTIME_PYTHON_MAP`.
 
+### Model profiles
+
+A public model ID resolves to a `ModelRoute` containing the requested ID, one
+canonical scheduler/cache key, and a behavior profile. Existing IDs implicitly
+use `subtitles-v1`. `qwen-1.7b-edit-max` uses `edit-max-v1` while resolving to
+the same `qwen3-asr-1.7b` canonical model as `qwen-1.7b`; therefore both IDs
+share one worker, aligner cache, concurrency limit, and loaded weight set.
+
+`ASR_MODEL_PROFILE_MAP` is a replace-all public-ID-to-profile map. The edit ID
+is reserved and fail-closed: if it is exposed in an explicit alias map, its
+canonical target and explicit profile must be exactly
+`qwen3-asr-1.7b/edit-max-v1`. An old explicit alias map that omits the ID stays
+valid and simply does not expose it. This prevents a precision-editing request
+from silently falling back to subtitle behavior.
+
 ## Request flow
 
 ### Batch HTTP
@@ -140,6 +159,38 @@ or by canonical model with `ASR_MODEL_RUNTIME_PYTHON_MAP`.
 Diarization is intentionally limited to non-streaming transcription requests
 with `response_format=verbose_json`, so speaker labels are always visible to the
 client that paid the extra runtime cost.
+
+### Edit-max batch path
+
+The `edit-max-v1` profile is restricted to non-streaming batch transcription
+with `verbose_json`. Validation rejects other surfaces before upload reads or a
+model lease. Its path is deliberately separate from the legacy timestamp path:
+
+1. PyAV decodes the first audio stream once to sequential mono PCM16 at 16 kHz
+   and flushes the resampler tail.
+2. One canonical temporary WAV is written from those exact samples.
+3. Qwen transcribes the WAV, then its existing forced aligner aligns the exact
+   transcript and returns ungrouped words. Apple Silicon uses a directly cached
+   `mlx_qwen3_asr.ForcedAligner`; it does not rerun `Session.transcribe`.
+4. Faster Whisper's bundled Silero v6 ONNX asset emits a probability for each
+   512-sample frame. Entry/exit hysteresis produces coarse speech islands with
+   no generic padding.
+5. A bounded adaptive RMS search refines only each island's outside onset and
+   offset. The default 10 ms windows improve transition resolution relative to
+   the 32 ms VAD frames.
+6. Pure sample-native fusion associates aligned words with acoustic islands,
+   retains aligned quiet speech and strong transcript-free acoustic evidence,
+   and never moves internal word edges. Only energy-confirmed first/last word
+   edges may be adjusted within the configured 240 ms limit.
+7. Readable `segments` are grouped independently from the final editing
+   regions. Optional diarization uses the same canonical WAV, preserving the
+   word order addressed by editing word-index ranges.
+
+The public editing intervals are half-open integer sample ranges. Seconds are
+derived from samples, and `time_origin=decoded_audio_start` states that v1 is
+not a source-video/container PTS mapping. A non-empty transcript with no aligned
+words fails closed; the API never markets a VAD-only degraded transcript as a
+successful maximum-precision result.
 
 ### SSE streaming
 

@@ -65,17 +65,19 @@ def create_app() -> FastAPI:
     def list_models() -> dict[str, Any]:
         data = []
         for model_id in settings.supported_model_ids:
-            canonical = settings.model_alias_map.get(model_id, model_id)
-            spec = settings.model_settings[canonical]
-            data.append(
-                {
-                    "id": model_id,
-                    "object": "model",
-                    "owned_by": "local-asr",
-                    "family": spec.family,
-                    "backend": spec.backend,
-                }
-            )
+            route = settings.resolve_model_route(model_id)
+            spec = settings.model_settings[route.canonical_model]
+            item = {
+                "id": model_id,
+                "object": "model",
+                "owned_by": "local-asr",
+                "family": spec.family,
+                "backend": spec.backend,
+            }
+            if route.profile.is_edit_max:
+                item["profile"] = route.profile.name
+                item["canonical_model"] = route.canonical_model
+            data.append(item)
         return {
             "object": "list",
             "data": data,

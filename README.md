@@ -121,6 +121,7 @@ Backend:
 
 - `qwen-0.6b` -> `qwen3-asr-0.6b`
 - `qwen-1.7b` -> `qwen3-asr-1.7b`
+- `qwen-1.7b-edit-max` -> `qwen3-asr-1.7b` with profile `edit-max-v1`
 - `qwen3-asr-0.6b`
 - `qwen3-asr-1.7b`
 
@@ -135,7 +136,56 @@ Notes:
 - Qwen is transcription-only in this project for now
 - Qwen timestamps are produced with `Qwen/Qwen3-ForcedAligner-0.6B`; aligned
   words are grouped into readable segments for `verbose_json`, `srt`, and `vtt`
-- clients use the same model aliases on CUDA and Apple Silicon: `qwen-0.6b` and `qwen-1.7b`
+- clients use the same model aliases on CUDA and Apple Silicon
+
+### Edit-max profile
+
+`qwen-1.7b-edit-max` is the slow, editing-oriented profile. It leases the same
+canonical `qwen3-asr-1.7b` worker as `qwen-1.7b`; it does not load a second ASR
+model or duplicate model memory. It is supported only for non-streaming
+`POST /v1/audio/transcriptions` requests with `response_format=verbose_json`.
+
+The profile performs four local stages on one mono PCM16 16 kHz timeline:
+
+1. Qwen transcribes the complete audio without removing silence.
+2. Qwen ForcedAligner aligns the exact transcript and returns raw word timings.
+3. the Silero VAD v6 asset bundled with Faster Whisper detects speech islands;
+   an adaptive RMS pass refines only their outside edges at 10 ms resolution
+4. deterministic fusion preserves internal forced-alignment word boundaries,
+   keeps word-only quiet speech, and retains high-confidence VAD-only regions
+
+This separation is intentional. `segments` remain readable subtitle-sized
+groups, while `editing.speech_regions` represents speech/non-speech transitions
+for a timeline editor. Acoustic energy never invents word boundaries inside
+continuous speech.
+
+The editing timeline uses half-open sample intervals
+`[start_sample, end_sample)`. Sample zero means the first sequential decoded
+audio sample, reported as `time_origin=decoded_audio_start`; it is not an
+arbitrary source-video presentation timestamp. Every second value is derived
+from its integer sample index. Evidence values are:
+
+- `alignment_acoustic`: the transcript and acoustic detector support the region
+- `alignment_only`: forced alignment found speech missed by VAD
+- `acoustic_only`: strong acoustic evidence was retained despite no matching word
+
+The response also exposes VAD peak/mean probabilities and whether each outer
+edge was confirmed by local energy. These are diagnostics for automated policy;
+they are not calibrated guarantees. A non-empty transcript must have aligned
+words, otherwise edit-max fails rather than silently returning degraded timing.
+
+Existing explicit alias maps replace defaults. To opt an older `.env` into this
+profile, add both bindings together:
+
+```bash
+ASR_MODEL_ALIAS_MAP="...,qwen-1.7b-edit-max=qwen3-asr-1.7b"
+ASR_MODEL_PROFILE_MAP="qwen-1.7b-edit-max=edit-max-v1"
+```
+
+If the alias is omitted, the old configuration continues to work without the
+profile. If the reserved alias is present but the canonical target or profile
+binding is missing/wrong, startup fails instead of falling back to subtitle
+behavior.
 
 ### Speaker diarization
 
@@ -159,6 +209,37 @@ Notes:
   not identify real people by name
 - CPU is the conservative default on Apple Silicon; a 24 GB Mac can keep the
   diarization runtime isolated and unload it after the configured idle period
+
+### Third-party licensing and attribution
+
+The repository code remains MIT. The new edit-max path introduces no new model
+download and uses components that permit commercial use:
+
+- [Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) and
+  [Qwen3-ForcedAligner-0.6B](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B): Apache-2.0
+- `mlx-qwen3-asr`: Apache-2.0
+- `faster-whisper`, [Silero VAD](https://github.com/snakers4/silero-vad), and
+  ONNX Runtime: MIT
+- NumPy: BSD-3-Clause with additional licenses/notices for bundled components
+- existing optional
+  [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1):
+  CC BY 4.0, commercially usable with attribution, plus its existing gated
+  Hugging Face access conditions
+
+No current Hugging Face integration or configured model alias is removed by
+the profile. Locally supplied model paths remain the operator's responsibility;
+the project cannot infer the license of an arbitrary artifact from its path.
+The explicit CC BY attribution, model creators, copyright notices, modification
+statements, and requested research citations are recorded in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). That file is also included in
+built Python distributions.
+
+The existing `imageio-ffmpeg` wheel is a separate licensing consideration: it
+bundles an FFmpeg executable, and the currently installed macOS arm64 build is
+GPL-enabled. This does not change this source repository's MIT license, but a
+product that redistributes the executable must fulfill the applicable FFmpeg
+GPL source-and-notice obligations. The notice file documents this distinction
+and the checks required for other platform builds.
 
 ## Resource policy
 
@@ -188,6 +269,10 @@ Default reservations in [.env.example](.env.example):
 - [lazy_whisper_api/worker_protocol.py](lazy_whisper_api/worker_protocol.py): shared JSON-line subprocess transport for isolated runtimes
 - [lazy_whisper_api/model_manager.py](lazy_whisper_api/model_manager.py): leases, idle unloads, and capacity enforcement
 - [lazy_whisper_api/transcription.py](lazy_whisper_api/transcription.py): validation, uploads, decoding, and timestamp alignment helpers
+- [lazy_whisper_api/audio_timeline.py](lazy_whisper_api/audio_timeline.py): canonical sample-native edit-max decoding
+- [lazy_whisper_api/silero_vad.py](lazy_whisper_api/silero_vad.py): bundled Silero inference, hysteresis, and energy edge refinement
+- [lazy_whisper_api/editing.py](lazy_whisper_api/editing.py): deterministic word/acoustic fusion and readable segment grouping
+- [lazy_whisper_api/editing_types.py](lazy_whisper_api/editing_types.py): edit timeline, region, boundary, and VAD value objects
 - [lazy_whisper_api/diarization.py](lazy_whisper_api/diarization.py): diarization validation, reservation, and worker lifecycle
 - [lazy_whisper_api/diarization_types.py](lazy_whisper_api/diarization_types.py): shared diarization result value objects
 - [lazy_whisper_api/speaker_attribution.py](lazy_whisper_api/speaker_attribution.py): efficient timestamp reconciliation and readable speaker grouping
@@ -207,6 +292,7 @@ Default reservations in [.env.example](.env.example):
 - [requirements-diarization.txt](requirements-diarization.txt): pyannote diarization runtime dependencies
 - [docs/architecture.md](docs/architecture.md): deeper runtime notes
 - [docs/benchmarks.md](docs/benchmarks.md): machine-specific benchmark notes for the classic endpoint
+- [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md): model/runtime license inventory and attribution notes
 
 ## Benchmark Notes
 
@@ -274,6 +360,7 @@ Important settings:
 - `ASR_API_KEY`
 - `ASR_DEFAULT_MODEL`
 - `ASR_MODEL_ALIAS_MAP`
+- `ASR_MODEL_PROFILE_MAP`
 - `ASR_MODEL_SOURCE_MAP`
 - `ASR_MODEL_FAMILY_MAP`
 - `ASR_MODEL_BACKEND_MAP`
@@ -288,6 +375,7 @@ Important settings:
 - `ASR_MODEL_ALIGNER_DTYPE_MAP`
 - `ASR_FAMILY_RUNTIME_PYTHON_MAP`
 - `ASR_MODEL_RUNTIME_PYTHON_MAP`
+- `ASR_EDIT_MAX_*` (VAD, local-energy, association, and outer-word-snap thresholds)
 - `ASR_DIARIZATION_ENABLED`
 - `ASR_DIARIZATION_BACKEND`
 - `ASR_DIARIZATION_MODEL_ID`
@@ -333,6 +421,68 @@ curl -X POST http://localhost:43556/v1/audio/transcriptions \
 
 Use `qwen-1.7b` for best transcription quality and `qwen-0.6b` when startup
 time, memory, or disk use matter more than the last bit of accuracy.
+
+Edit-oriented maximum timing:
+
+```bash
+curl -X POST http://localhost:43556/v1/audio/transcriptions \
+  -H "Authorization: Bearer your-api-key" \
+  -F file=@video.mp4 \
+  -F model=qwen-1.7b-edit-max \
+  -F response_format=verbose_json
+```
+
+Word timing is automatic for this profile; callers do not need to send
+`timestamp_granularities[]`. An abridged response showing the additive shape is:
+
+```json
+{
+  "model": "qwen3-asr-1.7b",
+  "text": "Example transcript",
+  "words": [
+    {"start": 0.5, "end": 1.1, "word": "Example", "probability": null},
+    {"start": 1.15, "end": 2.0, "word": "transcript", "probability": null}
+  ],
+  "editing": {
+    "schema_version": 1,
+    "profile": "edit-max-v1",
+    "requested_model": "qwen-1.7b-edit-max",
+    "canonical_model": "qwen3-asr-1.7b",
+    "timeline": {
+      "sample_rate_hz": 16000,
+      "sample_count": 48000,
+      "duration": 3.0,
+      "time_origin": "decoded_audio_start"
+    },
+    "speech_regions": [
+      {
+        "id": 0,
+        "start_sample": 8000,
+        "end_sample": 32000,
+        "start": 0.5,
+        "end": 2.0,
+        "evidence": "alignment_acoustic",
+        "word_start_index": 0,
+        "word_end_index": 2,
+        "vad_peak_probability": 0.97,
+        "vad_mean_probability": 0.91,
+        "start_energy_confirmed": true,
+        "end_energy_confirmed": true
+      }
+    ],
+    "edit_boundaries": [
+      {
+        "region_id": 0,
+        "type": "speech_start",
+        "sample": 8000,
+        "time": 0.5,
+        "evidence": "alignment_acoustic",
+        "energy_confirmed": true
+      }
+    ]
+  }
+}
+```
 
 Speaker diarization:
 
@@ -417,6 +567,10 @@ The first Qwen request may take a while because it has to:
 - download the model from Hugging Face if it is not cached yet
 - start the isolated worker
 - load the model onto GPU
+
+The first timestamped/edit-max request may also load the configured Qwen forced
+aligner. Edit-max initializes Silero from Faster Whisper's already-installed
+local ONNX asset and does not download a separate VAD model.
 
 After that first load, Qwen follows the same lazy policy as the rest of the API: it stays warm for its configured idle window and unloads afterwards.
 

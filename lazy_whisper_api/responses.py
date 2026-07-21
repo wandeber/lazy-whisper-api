@@ -108,8 +108,51 @@ def build_verbose_json(result: TranscriptionResult) -> dict[str, Any]:
             if getattr(word, "speaker", None) is not None:
                 word_payload["speaker"] = word.speaker
             words.append(word_payload)
-    if words:
+    if words or result.editing is not None:
         payload["words"] = words
+    if result.editing is not None:
+        editing = result.editing
+        sample_rate = editing.timeline.sample_rate_hz
+        payload["editing"] = {
+            "schema_version": editing.schema_version,
+            "profile": editing.profile,
+            "requested_model": editing.requested_model,
+            "canonical_model": editing.canonical_model,
+            "timeline": {
+                "sample_rate_hz": sample_rate,
+                "sample_count": editing.timeline.sample_count,
+                "duration": editing.timeline.duration,
+                "time_origin": "decoded_audio_start",
+            },
+            "speech_regions": [
+                {
+                    "id": region.id,
+                    "start_sample": region.start_sample,
+                    "end_sample": region.end_sample,
+                    "start": region.start_sample / float(sample_rate),
+                    "end": region.end_sample / float(sample_rate),
+                    "evidence": region.evidence,
+                    "word_start_index": region.word_start_index,
+                    "word_end_index": region.word_end_index,
+                    "vad_peak_probability": region.vad_peak_probability,
+                    "vad_mean_probability": region.vad_mean_probability,
+                    "start_energy_confirmed": region.start_energy_confirmed,
+                    "end_energy_confirmed": region.end_energy_confirmed,
+                }
+                for region in editing.speech_regions
+            ],
+            "edit_boundaries": [
+                {
+                    "region_id": boundary.region_id,
+                    "type": boundary.type,
+                    "sample": boundary.sample,
+                    "time": boundary.sample / float(sample_rate),
+                    "evidence": boundary.evidence,
+                    "energy_confirmed": boundary.energy_confirmed,
+                }
+                for boundary in editing.edit_boundaries
+            ],
+        }
     if result.diarization is not None:
         speakers = sorted({turn.speaker for turn in result.diarization.turns})
         speaker_segments = build_speaker_transcript_segments(segments=result.segments)

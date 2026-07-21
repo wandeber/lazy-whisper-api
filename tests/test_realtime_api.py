@@ -273,3 +273,26 @@ def test_realtime_accepts_qwen_model_selection(client) -> None:
 
     assert updated["type"] == "session.updated"
     assert updated["session"]["audio"]["input"]["transcription"]["model"] == "qwen3-asr-0.6b"
+
+
+def test_realtime_rejects_edit_max_profile(client) -> None:
+    with client.websocket_connect(f"/v1/realtime?api_key={TEST_API_KEY}") as websocket:
+        websocket.receive_json()
+        websocket.send_json(
+            {
+                "type": "session.update",
+                "session": {
+                    "type": "transcription",
+                    "audio": {
+                        "input": {
+                            "transcription": {"model": "qwen-1.7b-edit-max"},
+                        }
+                    },
+                },
+            }
+        )
+        error = websocket.receive_json()
+
+    assert error["type"] == "error"
+    assert error["error"]["type"] == "invalid_request_error"
+    assert "does not support realtime transcription" in error["error"]["message"]
